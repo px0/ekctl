@@ -186,6 +186,64 @@ class EventKitManager {
         }
     }
 
+    /// Edits an existing calendar event. Only non-nil fields are applied; a nil field
+    /// leaves the existing value untouched.
+    func editEvent(
+        eventID: String,
+        title: String?,
+        startDate: Date?,
+        endDate: Date?,
+        location: String?,
+        notes: String?,
+        allDay: Bool?,
+        calendarID: String?,
+        span: EKSpan
+    ) -> JSONOutput {
+        guard let event = eventStore.event(withIdentifier: eventID) else {
+            return JSONOutput.error("Event not found with ID: \(eventID)")
+        }
+
+        if let calendarID = calendarID {
+            guard let calendar = eventStore.calendar(withIdentifier: calendarID) else {
+                return JSONOutput.error("Calendar not found with ID: \(calendarID)")
+            }
+            guard calendar.allowsContentModifications else {
+                return JSONOutput.error("Calendar '\(calendar.title)' does not allow modifications.")
+            }
+            event.calendar = calendar
+        }
+
+        if let title = title {
+            event.title = title
+        }
+        if let startDate = startDate {
+            event.startDate = startDate
+        }
+        if let endDate = endDate {
+            event.endDate = endDate
+        }
+        if let location = location {
+            event.location = location
+        }
+        if let notes = notes {
+            event.notes = notes
+        }
+        if let allDay = allDay {
+            event.isAllDay = allDay
+        }
+
+        do {
+            try eventStore.save(event, span: span, commit: true)
+            return JSONOutput.success([
+                "status": "success",
+                "message": "Event updated successfully",
+                "event": eventToDict(event)
+            ])
+        } catch {
+            return JSONOutput.error("Failed to update event: \(error.localizedDescription)")
+        }
+    }
+
     /// Deletes a calendar event
     func deleteEvent(eventID: String) -> JSONOutput {
         guard let event = eventStore.event(withIdentifier: eventID) else {
@@ -252,7 +310,10 @@ class EventKitManager {
         title: String,
         dueDate: Date?,
         priority: Int,
-        notes: String?
+        notes: String?,
+        location: String? = nil,
+        radius: Double = 100,
+        proximity: String = "arrive"
     ) -> JSONOutput {
         guard let calendar = eventStore.calendar(withIdentifier: listID) else {
             return JSONOutput.error("Reminder list not found with ID: \(listID)")
@@ -269,10 +330,17 @@ class EventKitManager {
         reminder.notes = notes
 
         if let dueDate = dueDate {
-            reminder.dueDateComponents = Calendar.current.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second],
-                from: dueDate
-            )
+            reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
+        }
+
+        if let locationName = location {
+            let structuredLocation = EKStructuredLocation(title: locationName)
+            structuredLocation.radius = radius
+
+            let alarm = EKAlarm()
+            alarm.structuredLocation = structuredLocation
+            alarm.proximity = (proximity.lowercased() == "depart") ? .leave : .enter
+            reminder.addAlarm(alarm)
         }
 
         do {
@@ -284,6 +352,63 @@ class EventKitManager {
             ])
         } catch {
             return JSONOutput.error("Failed to create reminder: \(error.localizedDescription)")
+        }
+    }
+
+    /// Edits an existing reminder. Only non-nil fields are applied; a nil field
+    /// leaves the existing value untouched.
+    func editReminder(
+        reminderID: String,
+        title: String?,
+        dueDate: Date?,
+        clearDue: Bool,
+        priority: Int?,
+        notes: String?,
+        listID: String?
+    ) -> JSONOutput {
+        guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
+            return JSONOutput.error("Reminder not found with ID: \(reminderID)")
+        }
+
+        if clearDue && dueDate != nil {
+            return JSONOutput.error("Cannot specify both a due date and --clear-due.")
+        }
+
+        if let listID = listID {
+            guard let calendar = eventStore.calendar(withIdentifier: listID) else {
+                return JSONOutput.error("Reminder list not found with ID: \(listID)")
+            }
+            guard calendar.allowedEntityTypes.contains(.reminder) else {
+                return JSONOutput.error("Calendar '\(calendar.title)' is not a reminder list.")
+            }
+            reminder.calendar = calendar
+        }
+
+        if let title = title {
+            reminder.title = title
+        }
+        if let priority = priority {
+            reminder.priority = priority
+        }
+        if let notes = notes {
+            reminder.notes = notes
+        }
+
+        if clearDue {
+            reminder.dueDateComponents = nil
+        } else if let dueDate = dueDate {
+            reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
+        }
+
+        do {
+            try eventStore.save(reminder, commit: true)
+            return JSONOutput.success([
+                "status": "success",
+                "message": "Reminder updated successfully",
+                "reminder": reminderToDict(reminder)
+            ])
+        } catch {
+            return JSONOutput.error("Failed to update reminder: \(error.localizedDescription)")
         }
     }
 
@@ -329,6 +454,14 @@ class EventKitManager {
     }
 
     // MARK: - Helper Methods
+
+    /// Converts a due date into the date components EventKit expects for a reminder's due date.
+    private func reminderDueDateComponents(from date: Date) -> DateComponents {
+        Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: date
+        )
+    }
 
     /// Creates a date formatter that outputs ISO 8601 format in the user's local timezone
     private func localDateFormatter() -> DateFormatter {

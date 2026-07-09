@@ -10,7 +10,7 @@ struct Ekctl: ParsableCommand {
         commandName: "ekctl",
         abstract: "A command-line tool for managing macOS Calendar events and Reminders using EventKit.",
         version: "1.2.0",
-        subcommands: [List.self, Show.self, Add.self, Delete.self, Complete.self, Alias.self],
+        subcommands: [List.self, Show.self, Add.self, Edit.self, Delete.self, Complete.self, Alias.self],
         defaultSubcommand: List.self
     )
 }
@@ -220,6 +220,15 @@ struct AddReminder: ParsableCommand {
     @Option(name: .long, help: "Optional notes.")
     var notes: String?
 
+    @Option(name: .long, help: "Optional location name or address to trigger reminder (e.g. '1 Infinite Loop, Cupertino, CA').")
+    var location: String?
+
+    @Option(name: .long, help: "Location trigger radius in meters (default: 100).")
+    var radius: Double?
+
+    @Option(name: .long, help: "Location trigger: 'arrive' or 'depart' (default: arrive).")
+    var proximity: String?
+
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
@@ -239,7 +248,178 @@ struct AddReminder: ParsableCommand {
             title: title,
             dueDate: dueDate,
             priority: priority ?? 0,
-            notes: notes
+            notes: notes,
+            location: location,
+            radius: radius ?? 100,
+            proximity: proximity ?? "arrive"
+        )
+        print(result.toJSON())
+    }
+}
+
+// MARK: - Edit Commands
+
+struct Edit: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "edit",
+        abstract: "Edit an existing event or reminder.",
+        subcommands: [EditEvent.self, EditReminder.self]
+    )
+}
+
+struct EditEvent: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "event",
+        abstract: "Edit an existing calendar event. Only the options you pass are changed."
+    )
+
+    @Argument(help: "The event ID to edit.")
+    var id: String
+
+    @Option(name: .long, help: "New event title.")
+    var title: String?
+
+    @Option(name: .long, help: "New start date in ISO8601 format.")
+    var start: String?
+
+    @Option(name: .long, help: "New end date in ISO8601 format.")
+    var end: String?
+
+    @Option(name: .long, help: "New location.")
+    var location: String?
+
+    @Option(name: .long, help: "New notes.")
+    var notes: String?
+
+    @Option(name: .long, help: "Move the event to another calendar (ID or alias).")
+    var calendar: String?
+
+    @Flag(name: .long, inversion: .prefixedNo, help: "Mark as all-day (--all-day) or not (--no-all-day).")
+    var allDay: Bool?
+
+    @Option(name: .long, help: "Which occurrences to apply the edit to for recurring events: 'thisEvent' or 'futureEvents' (default: thisEvent).")
+    var span: String?
+
+    func run() throws {
+        let manager = EventKitManager()
+        try manager.requestAccess()
+
+        var startDate: Date?
+        if let start = start {
+            guard let parsed = ISO8601DateFormatter().date(from: start) else {
+                print(JSONOutput.error("Invalid --start date format. Use ISO8601.").toJSON())
+                throw ExitCode.failure
+            }
+            startDate = parsed
+        }
+
+        var endDate: Date?
+        if let end = end {
+            guard let parsed = ISO8601DateFormatter().date(from: end) else {
+                print(JSONOutput.error("Invalid --end date format. Use ISO8601.").toJSON())
+                throw ExitCode.failure
+            }
+            endDate = parsed
+        }
+
+        guard title != nil || startDate != nil || endDate != nil || location != nil
+            || notes != nil || allDay != nil || calendar != nil else {
+            print(JSONOutput.error(
+                "Nothing to change — pass at least one of --title/--start/--end/--location/--notes/--all-day/--calendar"
+            ).toJSON())
+            throw ExitCode.failure
+        }
+
+        let ekSpan: EKSpan
+        switch span ?? "thisEvent" {
+        case "thisEvent":
+            ekSpan = .thisEvent
+        case "futureEvents":
+            ekSpan = .futureEvents
+        default:
+            print(JSONOutput.error("Invalid --span value. Use 'thisEvent' or 'futureEvents'.").toJSON())
+            throw ExitCode.failure
+        }
+
+        let calendarID = calendar.map { ConfigManager.resolveAlias($0) }
+
+        let result = manager.editEvent(
+            eventID: id,
+            title: title,
+            startDate: startDate,
+            endDate: endDate,
+            location: location,
+            notes: notes,
+            allDay: allDay,
+            calendarID: calendarID,
+            span: ekSpan
+        )
+        print(result.toJSON())
+    }
+}
+
+struct EditReminder: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "reminder",
+        abstract: "Edit an existing reminder. Only the options you pass are changed."
+    )
+
+    @Argument(help: "The reminder ID to edit.")
+    var id: String
+
+    @Option(name: .long, help: "New reminder title.")
+    var title: String?
+
+    @Option(name: .long, help: "New due date in ISO8601 format.")
+    var due: String?
+
+    @Flag(name: .long, help: "Clear the due date.")
+    var clearDue: Bool = false
+
+    @Option(name: .long, help: "Priority (0=none, 1=high, 5=medium, 9=low).")
+    var priority: Int?
+
+    @Option(name: .long, help: "New notes.")
+    var notes: String?
+
+    @Option(name: .long, help: "Move the reminder to another reminder list (ID or alias).")
+    var list: String?
+
+    func run() throws {
+        let manager = EventKitManager()
+        try manager.requestAccess()
+
+        guard title != nil || due != nil || clearDue || priority != nil || notes != nil || list != nil else {
+            print(JSONOutput.error(
+                "Nothing to change — pass at least one of --title/--due/--clear-due/--priority/--notes/--list"
+            ).toJSON())
+            throw ExitCode.failure
+        }
+
+        var dueDate: Date?
+        if let due = due {
+            guard let parsed = ISO8601DateFormatter().date(from: due) else {
+                print(JSONOutput.error("Invalid --due date format. Use ISO8601.").toJSON())
+                throw ExitCode.failure
+            }
+            dueDate = parsed
+        }
+
+        if dueDate != nil && clearDue {
+            print(JSONOutput.error("Cannot specify both --due and --clear-due.").toJSON())
+            throw ExitCode.failure
+        }
+
+        let listID = list.map { ConfigManager.resolveAlias($0) }
+
+        let result = manager.editReminder(
+            reminderID: id,
+            title: title,
+            dueDate: dueDate,
+            clearDue: clearDue,
+            priority: priority,
+            notes: notes,
+            listID: listID
         )
         print(result.toJSON())
     }

@@ -4,8 +4,8 @@ A native macOS command-line tool for managing Calendar events and Reminders usin
 
 ## Features
 
-- List, create, and delete calendar events
-- List, create, complete, and delete reminders
+- List, create, edit, and delete calendar events
+- List, create, edit, complete, and delete reminders
 - **Calendar aliases** - Use friendly names instead of long IDs
 - JSON output for easy parsing and scripting
 - Full EventKit integration with proper permission handling
@@ -230,6 +230,64 @@ Output:
 }
 ```
 
+### Edit an Event
+
+Update fields on an existing event without recreating it — the event's ID, alarms, recurrence, and invitation state are preserved. Only the options you pass are changed; everything else is left as-is.
+
+```bash
+# Change the title and location
+ekctl edit event "ABC123:DEF456" \
+  --title "Lunch with Client (moved)" \
+  --location "Building 4, Room 12"
+
+# Reschedule
+ekctl edit event "ABC123:DEF456" \
+  --start "2026-02-10T13:00:00Z" \
+  --end "2026-02-10T14:00:00Z"
+
+# Move to another calendar (ID or alias)
+ekctl edit event "ABC123:DEF456" --calendar personal
+
+# Turn an all-day event back into a timed event
+ekctl edit event "ABC123:DEF456" \
+  --no-all-day \
+  --start "2026-03-01T09:00:00Z" \
+  --end "2026-03-01T10:00:00Z"
+
+# Edit a recurring event: apply the change only to this occurrence (default)
+# or to this and all future occurrences
+ekctl edit event "ABC123:DEF456" --title "New name" --span futureEvents
+```
+
+Output:
+```json
+{
+  "status": "success",
+  "message": "Event updated successfully",
+  "event": {
+    "id": "ABC123:DEF456",
+    "title": "Lunch with Client (moved)",
+    "calendar": {
+      "id": "CA513B39-1659-4359-8FE9-0C2A3DCEF153",
+      "title": "Work"
+    },
+    "startDate": "2026-02-10T12:30:00Z",
+    "endDate": "2026-02-10T13:30:00Z",
+    "location": "Building 4, Room 12",
+    "notes": null,
+    "allDay": false
+  }
+}
+```
+
+If you don't pass any field to change:
+```json
+{
+  "status": "error",
+  "error": "Nothing to change — pass at least one of --title/--start/--end/--location/--notes/--all-day/--calendar"
+}
+```
+
 ### Delete Event
 
 ```bash
@@ -331,6 +389,54 @@ Output:
     "priority": 0,
     "notes": null
   }
+}
+```
+
+### Edit a Reminder
+
+Update fields on an existing reminder without recreating it. Only the options you pass are changed; everything else is left as-is.
+
+```bash
+# Change the title and priority
+ekctl edit reminder "REM123-456-789" \
+  --title "Buy oat milk" \
+  --priority 1
+
+# Reschedule the due date
+ekctl edit reminder "REM123-456-789" --due "2026-02-05T09:00:00Z"
+
+# Clear the due date entirely
+ekctl edit reminder "REM123-456-789" --clear-due
+
+# Move to another reminder list (ID or alias)
+ekctl edit reminder "REM123-456-789" --list groceries
+```
+
+Output:
+```json
+{
+  "status": "success",
+  "message": "Reminder updated successfully",
+  "reminder": {
+    "id": "REM123-456-789",
+    "title": "Buy oat milk",
+    "list": {
+      "id": "4E367C6F-354B-4811-935E-7F25A1BB7D39",
+      "title": "Reminders"
+    },
+    "dueDate": "2026-02-05T09:00:00Z",
+    "completed": false,
+    "priority": 1,
+    "notes": null
+  }
+}
+```
+
+Passing both `--due` and `--clear-due` is rejected rather than guessed:
+```json
+{
+  "status": "error",
+  "error": "Cannot specify both --due and --clear-due."
 }
 ```
 
@@ -449,6 +555,8 @@ Get help for any command:
 ekctl --help
 ekctl list --help
 ekctl add event --help
+ekctl edit event --help
+ekctl edit reminder --help
 ekctl list reminders --help
 ```
 
