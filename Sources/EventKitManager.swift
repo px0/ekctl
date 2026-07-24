@@ -147,6 +147,23 @@ class EventKitManager {
         return JSONOutput.success(["event": eventToDict(event)])
     }
 
+    /// Parses a user-supplied URL string. An explicit scheme is required: EventKit would happily
+    /// store a bare "example.com" as a relative URL, which then shows up in Calendar.app as a link
+    /// that does nothing. Failing here is better than writing a dead link into an event.
+    static func parseURL(_ string: String) -> URL? {
+        guard let url = URL(string: string), let scheme = url.scheme, !scheme.isEmpty else {
+            return nil
+        }
+        if scheme == "http" || scheme == "https" {
+            guard let host = url.host(), !host.isEmpty else { return nil }
+        }
+        return url
+    }
+
+    static func invalidURLMessage(_ string: String) -> String {
+        "Invalid --url '\(string)'. Include a scheme (and host), e.g. https://example.com"
+    }
+
     /// Creates a new calendar event
     func addEvent(
         calendarID: String,
@@ -155,6 +172,7 @@ class EventKitManager {
         endDate: Date,
         location: String?,
         notes: String?,
+        url: String?,
         allDay: Bool
     ) -> JSONOutput {
         guard let calendar = eventStore.calendar(withIdentifier: calendarID) else {
@@ -165,6 +183,14 @@ class EventKitManager {
             return JSONOutput.error("Calendar '\(calendar.title)' does not allow modifications.")
         }
 
+        var parsedURL: URL?
+        if let url = url, !url.isEmpty {
+            guard let candidate = Self.parseURL(url) else {
+                return JSONOutput.error(Self.invalidURLMessage(url))
+            }
+            parsedURL = candidate
+        }
+
         let event = EKEvent(eventStore: eventStore)
         event.calendar = calendar
         event.title = title
@@ -172,6 +198,7 @@ class EventKitManager {
         event.endDate = endDate
         event.location = location
         event.notes = notes
+        event.url = parsedURL
         event.isAllDay = allDay
 
         do {
@@ -195,12 +222,28 @@ class EventKitManager {
         endDate: Date?,
         location: String?,
         notes: String?,
+        url: String?,
         allDay: Bool?,
         calendarID: String?,
         span: EKSpan
     ) -> JSONOutput {
         guard let event = eventStore.event(withIdentifier: eventID) else {
             return JSONOutput.error("Event not found with ID: \(eventID)")
+        }
+
+        // Resolve the URL before touching the event: the EKEvent is a live store object, so a
+        // late validation failure would leave the other fields already applied in memory.
+        // Outer nil = not passed, inner nil = explicitly cleared with an empty string.
+        var resolvedURL: URL??
+        if let url = url {
+            if url.isEmpty {
+                resolvedURL = .some(nil)
+            } else {
+                guard let candidate = Self.parseURL(url) else {
+                    return JSONOutput.error(Self.invalidURLMessage(url))
+                }
+                resolvedURL = .some(candidate)
+            }
         }
 
         if let calendarID = calendarID {
@@ -227,6 +270,9 @@ class EventKitManager {
         }
         if let notes = notes {
             event.notes = notes
+        }
+        if let resolvedURL = resolvedURL {
+            event.url = resolvedURL
         }
         if let allDay = allDay {
             event.isAllDay = allDay

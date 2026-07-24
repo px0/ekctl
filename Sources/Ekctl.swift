@@ -169,6 +169,9 @@ struct AddEvent: ParsableCommand {
     @Option(name: .long, help: "Optional notes.")
     var notes: String?
 
+    @Option(name: .long, help: "Optional URL. Must include a scheme, e.g. https://example.com")
+    var url: String?
+
     @Flag(name: .long, help: "Mark as all-day event.")
     var allDay: Bool = false
 
@@ -193,6 +196,7 @@ struct AddEvent: ParsableCommand {
             endDate: endDate,
             location: location,
             notes: notes,
+            url: url,
             allDay: allDay
         )
         print(result.toJSON())
@@ -291,6 +295,9 @@ struct EditEvent: ParsableCommand {
     @Option(name: .long, help: "New notes.")
     var notes: String?
 
+    @Option(name: .long, help: "New URL. Must include a scheme; pass an empty string to clear it.")
+    var url: String?
+
     @Option(name: .long, help: "Move the event to another calendar (ID or alias).")
     var calendar: String?
 
@@ -323,9 +330,9 @@ struct EditEvent: ParsableCommand {
         }
 
         guard title != nil || startDate != nil || endDate != nil || location != nil
-            || notes != nil || allDay != nil || calendar != nil else {
+            || notes != nil || url != nil || allDay != nil || calendar != nil else {
             print(JSONOutput.error(
-                "Nothing to change — pass at least one of --title/--start/--end/--location/--notes/--all-day/--calendar"
+                "Nothing to change — pass at least one of --title/--start/--end/--location/--notes/--url/--all-day/--calendar"
             ).toJSON())
             throw ExitCode.failure
         }
@@ -350,6 +357,7 @@ struct EditEvent: ParsableCommand {
             endDate: endDate,
             location: location,
             notes: notes,
+            url: url,
             allDay: allDay,
             calendarID: calendarID,
             span: ekSpan
