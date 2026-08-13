@@ -18,11 +18,26 @@ struct JSONOutput {
         return JSONOutput(output)
     }
 
+    /// What kind of failure this is, for callers that must branch on it.
+    ///
+    /// Prose is for humans and changes freely; a program that decides between "this reminder is
+    /// gone, stop retrying" and "try again later" cannot be left matching on the wording. Anything
+    /// without a more specific kind is `failed`.
+    enum ErrorCode: String {
+        case notFound = "not_found"
+        case notModifiable = "not_modifiable"
+        case invalidInput = "invalid_input"
+        case permissionDenied = "permission_denied"
+        case conflict = "conflict"
+        case failed = "failed"
+    }
+
     /// Creates an error response with the given message
-    static func error(_ message: String) -> JSONOutput {
+    static func error(_ message: String, code: ErrorCode = .failed) -> JSONOutput {
         return JSONOutput([
             "status": "error",
-            "error": message
+            "error": message,
+            "code": code.rawValue
         ])
     }
 

@@ -7,6 +7,8 @@ A native macOS command-line tool for managing Calendar events and Reminders usin
 - List, create, edit, and delete calendar events
 - List, create, edit, complete, and delete reminders
 - **Location triggers** on reminders — geocoded geofences that fire on arrival or departure
+- **Cross-list reminder search**, bounded by completion age so it stays fast
+- Create and delete reminder lists; address any list by ID, alias, or title
 - **Calendar aliases** - Use friendly names instead of long IDs
 - JSON output for easy parsing and scripting
 - Full EventKit integration with proper permission handling
@@ -351,11 +353,32 @@ fetch, rather than listing each list in turn:
 ekctl search reminders --query "costco"
 ekctl search reminders --query "passport" --completed false
 ekctl search reminders --query "call" --list groceries --limit 20
+ekctl search reminders --query "dentist" --completed-since-days 0   # whole history
+ekctl search reminders --url "spock://follow-up/fu_123"             # exact identity lookup
 ```
 
-The result carries `count`, the `searchedLists` it covered, and — when `--limit` cut the result —
-`truncated: true` with `totalMatches`, so a bounded answer never reads as a complete one. Matches are
-ordered by due date, undated last.
+The result carries `count`, the `searchedLists` it covered, `completedSearchedSince`, and — when
+`--limit` cut the result — `truncated: true` with `totalMatches`, so a bounded answer never reads as
+a complete one. Matches are ordered by due date, undated last.
+
+**Completed reminders are searched back 90 days by default.** A store accumulates completions
+forever — 4,414 reminders against 184 open ones on the author's machine — and searching all of them
+to answer "is this already on a list, or did I just do it?" costs about a second. Bounding the
+completed half brings that to roughly 220 ms. Widen it with `--completed-since-days`, using `0` for
+no limit, whenever the question is whether something was *ever* done. `--url` always searches the
+whole store, since a URL is an identity rather than a text query.
+
+### Create and Delete Reminder Lists
+
+```bash
+ekctl add list --title "Reading"
+ekctl add list --title "Work errands" --source iCloud
+ekctl delete list "Reading"            # refuses if it still holds reminders
+ekctl delete list "Reading" --force    # deletes the list and its reminders
+```
+
+A new list is created in the account that holds the default reminder list unless `--source` names
+another; picking the wrong account is how a list ends up never syncing to the phone.
 
 ### Show Reminder Details
 
@@ -647,6 +670,10 @@ Common errors:
 - `Permission denied` - Grant access in System Settings
 - `Calendar not found` - Check the calendar ID with `list calendars`
 - `Invalid date format` - Use ISO 8601 format (see examples above)
+
+Every error receipt also carries a machine-readable `code` — `not_found`, `not_modifiable`,
+`invalid_input`, `permission_denied`, `conflict`, or `failed` — so a program can distinguish "this is
+gone, stop retrying" from "try again later" without matching on prose that may be reworded.
 
 **An error exits non-zero.** Every command that prints `{"status":"error"}` exits 1, so `set -e`,
 `&&` chains, and tool harnesses see the failure without parsing anything. The JSON remains the

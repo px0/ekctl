@@ -79,7 +79,7 @@ struct Ekctl: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ekctl",
         abstract: "A command-line tool for managing macOS Calendar events and Reminders using EventKit.",
-        version: "1.4.0",
+        version: "1.5.0",
         subcommands: [
             List.self, Search.self, Show.self, Add.self, Edit.self, Delete.self, Complete.self,
             Alias.self,
@@ -182,9 +182,12 @@ struct SearchReminders: ParsableCommand {
     )
 
     @Option(name: .long, help: "Text to look for in reminder titles and notes (case-insensitive).")
-    var query: String
+    var query: String?
 
-    @Option(name: .long, help: "Restrict the search to one reminder list (ID or alias).")
+    @Option(name: .long, help: "Exact reminder URL to match. Searches the whole store, including old completions, since a URL is an identity rather than a text query.")
+    var url: String?
+
+    @Option(name: .long, help: "Restrict the search to one reminder list (ID, alias, or title; an alias of the same name wins).")
     var list: String?
 
     @Option(name: .long, help: "Filter by completion status (true/false).")
@@ -193,13 +196,27 @@ struct SearchReminders: ParsableCommand {
     @Option(name: .long, help: "Maximum number of matches to return.")
     var limit: Int?
 
+    @Option(name: .long, help: "How far back to search completed reminders, in days (default: 90). Use 0 for no limit.")
+    var completedSinceDays: Int?
+
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
 
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            try JSONOutput.error("--query must not be empty.").emit()
+        var completedSince: Date?
+        if let days = completedSinceDays {
+            guard days >= 0 else {
+                try JSONOutput.error("--completed-since-days cannot be negative.").emit()
+                return
+            }
+            completedSince = days == 0
+                ? Date.distantPast
+                : Calendar.current.date(byAdding: .day, value: -days, to: Date())
+        }
+
+        let trimmed = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if url == nil, trimmed?.isEmpty != false {
+            try JSONOutput.error("Pass --query (non-empty) or --url.").emit()
             return
         }
         if let limit = limit, limit <= 0 {
@@ -208,10 +225,12 @@ struct SearchReminders: ParsableCommand {
         }
 
         let result = manager.searchReminders(
-            query: trimmed,
+            query: trimmed?.isEmpty == false ? trimmed : nil,
             listID: list.map { ConfigManager.resolveAlias($0) },
             completed: completed,
-            limit: limit
+            limit: limit,
+            completedSince: completedSince,
+            url: url
         )
         try result.emit()
     }
@@ -264,9 +283,28 @@ struct ShowReminder: ParsableCommand {
 
 struct Add: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Add a new event or reminder.",
-        subcommands: [AddEvent.self, AddReminder.self]
+        abstract: "Add a new event, reminder, or reminder list.",
+        subcommands: [AddEvent.self, AddReminder.self, AddList.self]
     )
+}
+
+struct AddList: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "list",
+        abstract: "Create a reminder list."
+    )
+
+    @Option(name: .long, help: "The reminder list title.")
+    var title: String
+
+    @Option(name: .long, help: "Account to create it in (e.g. 'iCloud'). Defaults to the account holding the default reminder list.")
+    var source: String?
+
+    func run() throws {
+        let manager = EventKitManager()
+        try manager.requestAccess()
+        try manager.addReminderList(title: title, sourceName: source).emit()
+    }
 }
 
 struct AddEvent: ParsableCommand {
@@ -348,6 +386,9 @@ struct AddReminder: ParsableCommand {
     @Option(name: .long, help: "Optional notes.")
     var notes: String?
 
+    @Option(name: .long, help: "Optional URL. Must include a scheme, e.g. https://example.com or a custom scheme.")
+    var url: String?
+
     @OptionGroup var locationOptions: LocationOptions
 
     func run() throws {
@@ -378,6 +419,7 @@ struct AddReminder: ParsableCommand {
             dueDate: dueDate,
             priority: priority ?? 0,
             notes: notes,
+            url: url,
             location: locationOptions.location,
             coordinate: coordinate,
             radius: locationOptions.radius ?? EventKitManager.defaultLocationRadius,
@@ -582,9 +624,28 @@ struct EditReminder: ParsableCommand {
 
 struct Delete: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Delete an event or reminder.",
-        subcommands: [DeleteEvent.self, DeleteReminder.self]
+        abstract: "Delete an event, reminder, or reminder list.",
+        subcommands: [DeleteEvent.self, DeleteReminder.self, DeleteList.self]
     )
+}
+
+struct DeleteList: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "list",
+        abstract: "Delete a reminder list. Refuses a list that still holds reminders unless --force."
+    )
+
+    @Argument(help: "The reminder list ID, alias, or title.")
+    var list: String
+
+    @Flag(name: .long, help: "Delete the list even though it still holds reminders. They go with it.")
+    var force: Bool = false
+
+    func run() throws {
+        let manager = EventKitManager()
+        try manager.requestAccess()
+        try manager.deleteReminderList(ConfigManager.resolveAlias(list), force: force).emit()
+    }
 }
 
 struct DeleteEvent: ParsableCommand {

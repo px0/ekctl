@@ -124,7 +124,7 @@ class EventKitManager {
     /// Lists events in a calendar within a date range
     func listEvents(calendarID: String, from startDate: Date, to endDate: Date) -> JSONOutput {
         guard let calendar = eventStore.calendar(withIdentifier: calendarID) else {
-            return JSONOutput.error("Calendar not found with ID: \(calendarID)")
+            return JSONOutput.error("Calendar not found with ID: \(calendarID)", code: .notFound)
         }
 
         let predicate = eventStore.predicateForEvents(
@@ -142,7 +142,7 @@ class EventKitManager {
     /// Shows details of a specific event
     func showEvent(eventID: String) -> JSONOutput {
         guard let event = eventStore.event(withIdentifier: eventID) else {
-            return JSONOutput.error("Event not found with ID: \(eventID)")
+            return JSONOutput.error("Event not found with ID: \(eventID)", code: .notFound)
         }
 
         return JSONOutput.success(["event": eventToDict(event)])
@@ -177,11 +177,11 @@ class EventKitManager {
         allDay: Bool
     ) -> JSONOutput {
         guard let calendar = eventStore.calendar(withIdentifier: calendarID) else {
-            return JSONOutput.error("Calendar not found with ID: \(calendarID)")
+            return JSONOutput.error("Calendar not found with ID: \(calendarID)", code: .notFound)
         }
 
         guard calendar.allowsContentModifications else {
-            return JSONOutput.error("Calendar '\(calendar.title)' does not allow modifications.")
+            return JSONOutput.error("Calendar '\(calendar.title)' does not allow modifications.", code: .notModifiable)
         }
 
         var parsedURL: URL?
@@ -229,7 +229,7 @@ class EventKitManager {
         span: EKSpan
     ) -> JSONOutput {
         guard let event = eventStore.event(withIdentifier: eventID) else {
-            return JSONOutput.error("Event not found with ID: \(eventID)")
+            return JSONOutput.error("Event not found with ID: \(eventID)", code: .notFound)
         }
 
         // Resolve the URL before touching the event: the EKEvent is a live store object, so a
@@ -249,10 +249,10 @@ class EventKitManager {
 
         if let calendarID = calendarID {
             guard let calendar = eventStore.calendar(withIdentifier: calendarID) else {
-                return JSONOutput.error("Calendar not found with ID: \(calendarID)")
+                return JSONOutput.error("Calendar not found with ID: \(calendarID)", code: .notFound)
             }
             guard calendar.allowsContentModifications else {
-                return JSONOutput.error("Calendar '\(calendar.title)' does not allow modifications.")
+                return JSONOutput.error("Calendar '\(calendar.title)' does not allow modifications.", code: .notModifiable)
             }
             event.calendar = calendar
         }
@@ -294,7 +294,7 @@ class EventKitManager {
     /// Deletes a calendar event
     func deleteEvent(eventID: String) -> JSONOutput {
         guard let event = eventStore.event(withIdentifier: eventID) else {
-            return JSONOutput.error("Event not found with ID: \(eventID)")
+            return JSONOutput.error("Event not found with ID: \(eventID)", code: .notFound)
         }
 
         let title = event.title ?? "Untitled"
@@ -315,8 +315,10 @@ class EventKitManager {
 
     /// Lists reminders in a reminder list
     func listReminders(listID: String, completed: Bool?) -> JSONOutput {
-        guard let calendar = eventStore.calendar(withIdentifier: listID) else {
-            return JSONOutput.error("Reminder list not found with ID: \(listID)")
+        let calendar: EKCalendar
+        switch resolveReminderList(listID) {
+        case .success(let resolved): calendar = resolved
+        case .failure(let error): return JSONOutput.error(error.message, code: error.code)
         }
 
         let predicate = eventStore.predicateForReminders(in: [calendar])
@@ -342,18 +344,193 @@ class EventKitManager {
         return JSONOutput.success(["reminders": reminderDicts, "count": reminderDicts.count])
     }
 
+    /// Resolves what a caller typed into a reminder list.
+    ///
+    /// Callers hold names, EventKit holds identifiers, and list identifiers change when macOS
+    /// rebuilds its store — so requiring an id means every caller first runs `list calendars`, which
+    /// is a second process for every write. Identifier wins over title, so a list whose title
+    /// happens to look like another list's id can never shadow it; an ambiguous title is an error
+    /// rather than a coin flip, because the two lists may live in different accounts.
+    struct ListResolutionError: Error {
+        let message: String
+        let code: JSONOutput.ErrorCode
+    }
+
+    func resolveReminderList(_ nameOrID: String) -> Result<EKCalendar, ListResolutionError> {
+        let value = nameOrID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return .failure(ListResolutionError(message: "A reminder list must be named.", code: .invalidInput)) }
+
+        if let byIdentifier = eventStore.calendar(withIdentifier: value),
+           byIdentifier.allowedEntityTypes.contains(.reminder) {
+            return .success(byIdentifier)
+        }
+
+        let lists = eventStore.calendars(for: .reminder)
+        let exact = lists.filter { $0.title == value }
+        if exact.count == 1 { return .success(exact[0]) }
+        if exact.count > 1 {
+            return .failure(ListResolutionError(message: ambiguous(value, exact), code: .conflict))
+        }
+
+        let insensitive = lists.filter {
+            $0.title.compare(value, options: .caseInsensitive) == .orderedSame
+        }
+        if insensitive.count == 1 { return .success(insensitive[0]) }
+        if insensitive.count > 1 {
+            return .failure(ListResolutionError(message: ambiguous(value, insensitive), code: .conflict))
+        }
+
+        let available = lists.map(\.title).sorted().joined(separator: ", ")
+        return .failure(ListResolutionError(message: "Reminder list '\(value)' not found. Available lists: \(available)", code: .notFound))
+    }
+
+    private func ambiguous(_ value: String, _ matches: [EKCalendar]) -> String {
+        let detail = matches.map { calendar in
+            "\(calendar.calendarIdentifier) (\(calendar.source?.title ?? "unknown account"))"
+        }.joined(separator: ", ")
+        return "Reminder list '\(value)' is ambiguous; pass one of these ids: \(detail)"
+    }
+
+    /// Creates a reminder list.
+    ///
+    /// The source matters: a list has to belong to an account (iCloud, a local store, an Exchange
+    /// mailbox), and picking the wrong one creates a list that never syncs to the phone. Absent an
+    /// explicit choice, inherit the account that already holds the default reminder list, which is
+    /// where the user's own new lists land.
+    func addReminderList(title: String, sourceName: String?) -> JSONOutput {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return JSONOutput.error("Reminder list title must not be empty.")
+        }
+        if let existing = eventStore.calendars(for: .reminder).first(where: {
+            $0.title.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }) {
+            return JSONOutput.error(
+                "A reminder list named '\(existing.title)' already exists (id \(existing.calendarIdentifier)).",
+                code: .conflict
+            )
+        }
+
+        let source: EKSource?
+        if let sourceName = sourceName {
+            source = eventStore.sources.first {
+                $0.title.compare(sourceName, options: .caseInsensitive) == .orderedSame
+                    && $0.calendars(for: .reminder).isEmpty == false
+            } ?? eventStore.sources.first {
+                $0.title.compare(sourceName, options: .caseInsensitive) == .orderedSame
+            }
+            guard source != nil else {
+                let available = Set(eventStore.calendars(for: .reminder).compactMap {
+                    $0.source?.title
+                }).sorted().joined(separator: ", ")
+                return JSONOutput.error(
+                    "No account named '\(sourceName)'. Accounts holding reminder lists: \(available)."
+                )
+            }
+        } else {
+            source = eventStore.defaultCalendarForNewReminders()?.source
+                ?? eventStore.sources.first { !$0.calendars(for: .reminder).isEmpty }
+        }
+
+        guard let resolvedSource = source else {
+            return JSONOutput.error("No account is available to hold a new reminder list.")
+        }
+
+        let calendar = EKCalendar(for: .reminder, eventStore: eventStore)
+        calendar.title = trimmed
+        calendar.source = resolvedSource
+
+        do {
+            try eventStore.saveCalendar(calendar, commit: true)
+            return JSONOutput.success([
+                "status": "success",
+                "message": "Reminder list created successfully",
+                "list": [
+                    "id": calendar.calendarIdentifier,
+                    "title": calendar.title,
+                    "type": "reminder",
+                    "source": resolvedSource.title,
+                ],
+            ])
+        } catch {
+            return JSONOutput.error("Failed to create reminder list: \(error.localizedDescription)")
+        }
+    }
+
+    /// Deletes a reminder list.
+    ///
+    /// Deleting a list takes its reminders with it and EventKit offers no undo, so a list that still
+    /// holds anything is refused unless the caller says otherwise. That keeps `add list` reversible
+    /// without making "remove this list" a way to lose work by accident.
+    func deleteReminderList(_ nameOrID: String, force: Bool) -> JSONOutput {
+        let calendar: EKCalendar
+        switch resolveReminderList(nameOrID) {
+        case .success(let resolved): calendar = resolved
+        case .failure(let error): return JSONOutput.error(error.message, code: error.code)
+        }
+
+        guard calendar.allowsContentModifications else {
+            return JSONOutput.error("Reminder list '\(calendar.title)' does not allow modifications.", code: .notModifiable)
+        }
+
+        let remaining = fetch(eventStore.predicateForReminders(in: [calendar]))
+        if !remaining.isEmpty && !force {
+            return JSONOutput.error(
+                "Reminder list '\(calendar.title)' still holds \(remaining.count) reminder"
+                    + "\(remaining.count == 1 ? "" : "s"); pass --force to delete it and them."
+            )
+        }
+
+        let title = calendar.title
+        let id = calendar.calendarIdentifier
+        do {
+            try eventStore.removeCalendar(calendar, commit: true)
+            return JSONOutput.success([
+                "status": "success",
+                "message": "Reminder list '\(title)' deleted successfully",
+                "deletedListID": id,
+                "deletedReminderCount": remaining.count,
+            ])
+        } catch {
+            return JSONOutput.error("Failed to delete reminder list: \(error.localizedDescription)")
+        }
+    }
+
     /// Searches reminder titles and notes across every list, or one named list.
     ///
     /// One process, one EventKit fetch. Doing this by listing each list in turn costs a subprocess
     /// and a store connection per list — measured at 5.4s across 24 lists, against 0.17s here — and
     /// searching is the most frequent reminder operation there is.
+    /// Runs one reminder predicate to completion.
+    private func fetch(_ predicate: NSPredicate) -> [EKReminder] {
+        var results: [EKReminder] = []
+        let semaphore = DispatchSemaphore(value: 0)
+        eventStore.fetchReminders(matching: predicate) { fetched in
+            results = fetched ?? []
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return results
+    }
+
+    /// How far back completed reminders are searched when the caller does not say.
+    ///
+    /// Searching is overwhelmingly a "does this already exist, or did I already do it?" question,
+    /// and a completion from last year answers neither — while the store keeps every completion
+    /// forever. Bounding the completed half by time is what keeps the search proportional to what is
+    /// actually being asked, and `--completed-since` widens it when a caller really wants history.
+    static let defaultCompletedSearchWindowDays = 90
+
     func searchReminders(
-        query: String, listID: String?, completed: Bool?, limit: Int?
+        query: String?, listID: String?, completed: Bool?, limit: Int?,
+        completedSince: Date? = nil, url: String? = nil
     ) -> JSONOutput {
         let calendars: [EKCalendar]
         if let listID = listID {
-            guard let calendar = eventStore.calendar(withIdentifier: listID) else {
-                return JSONOutput.error("Reminder list not found with ID: \(listID)")
+            let calendar: EKCalendar
+            switch resolveReminderList(listID) {
+            case .success(let resolved): calendar = resolved
+            case .failure(let error): return JSONOutput.error(error.message, code: error.code)
             }
             calendars = [calendar]
         } else {
@@ -364,25 +541,41 @@ class EventKitManager {
             return JSONOutput.success(["reminders": [], "count": 0, "query": query])
         }
 
-        let predicate = eventStore.predicateForReminders(in: calendars)
+        // A URL lookup is an exact identity question — a follow-up marker, say — so it must see the
+        // whole store, including a completion from years ago. Only the text search is windowed.
+        let effectiveCompletedSince = url != nil ? (completedSince ?? Date.distantPast) : completedSince
+
+        // Two bounded fetches rather than one unbounded one. `predicateForReminders(in:)` returns
+        // every reminder the store has ever held — here 4,414 rows against 184 open ones — and the
+        // completed 96% is what the search spends its time on.
+        let window = effectiveCompletedSince
+            ?? Calendar.current.date(
+                byAdding: .day, value: -Self.defaultCompletedSearchWindowDays, to: Date()
+            )!
 
         var reminders: [EKReminder] = []
-        let semaphore = DispatchSemaphore(value: 0)
-        eventStore.fetchReminders(matching: predicate) { fetchedReminders in
-            reminders = fetchedReminders ?? []
-            semaphore.signal()
+        if completed != true {
+            reminders += fetch(eventStore.predicateForIncompleteReminders(
+                withDueDateStarting: nil, ending: nil, calendars: calendars
+            ))
         }
-        semaphore.wait()
-
-        let needle = query.lowercased()
-        var matching = reminders.filter { reminder in
-            (reminder.title?.lowercased().contains(needle) ?? false)
-                || (reminder.notes?.lowercased().contains(needle) ?? false)
-        }
-        if let completed = completed {
-            matching = matching.filter { $0.isCompleted == completed }
+        if completed != false {
+            reminders += fetch(eventStore.predicateForCompletedReminders(
+                withCompletionDateStarting: window, ending: nil, calendars: calendars
+            ))
         }
 
+        var matching = reminders
+        if let url = url {
+            matching = matching.filter { $0.url?.absoluteString == url }
+        }
+        if let query = query {
+            let needle = query.lowercased()
+            matching = matching.filter { reminder in
+                (reminder.title?.lowercased().contains(needle) ?? false)
+                    || (reminder.notes?.lowercased().contains(needle) ?? false)
+            }
+        }
         // Most recently due first, undated last, so a truncated result keeps the useful end.
         matching.sort { left, right in
             let leftDate = left.dueDateComponents.flatMap { Calendar.current.date(from: $0) }
@@ -403,9 +596,18 @@ class EventKitManager {
         var payload: [String: Any] = [
             "reminders": matching.map { reminderToDict($0) },
             "count": matching.count,
-            "query": query,
+            "query": query ?? "",
             "searchedLists": calendars.count,
         ]
+        // State the coverage, so an empty result can be read as "not in this window" rather than
+        // "never existed". Callers that render results for a model depend on this being explicit.
+        if completed != false {
+            payload["completedSearchedSince"] = window == Date.distantPast
+                ? "all"
+                : localDateFormatter().string(from: window)
+        } else {
+            payload["completedSearchedSince"] = "none"
+        }
         if matching.count < total {
             payload["truncated"] = true
             payload["totalMatches"] = total
@@ -416,7 +618,7 @@ class EventKitManager {
     /// Shows details of a specific reminder
     func showReminder(reminderID: String) -> JSONOutput {
         guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
-            return JSONOutput.error("Reminder not found with ID: \(reminderID)")
+            return JSONOutput.error("Reminder not found with ID: \(reminderID)", code: .notFound)
         }
 
         return JSONOutput.success(["reminder": reminderToDict(reminder)])
@@ -429,17 +631,28 @@ class EventKitManager {
         dueDate: Date?,
         priority: Int,
         notes: String?,
+        url: String? = nil,
         location: String? = nil,
         coordinate: CLLocationCoordinate2D? = nil,
         radius: Double = EventKitManager.defaultLocationRadius,
         proximity: EKAlarmProximity = .enter
     ) -> JSONOutput {
-        guard let calendar = eventStore.calendar(withIdentifier: listID) else {
-            return JSONOutput.error("Reminder list not found with ID: \(listID)")
+        let calendar: EKCalendar
+        switch resolveReminderList(listID) {
+        case .success(let resolved): calendar = resolved
+        case .failure(let error): return JSONOutput.error(error.message, code: error.code)
         }
 
         guard calendar.allowsContentModifications else {
-            return JSONOutput.error("Reminder list '\(calendar.title)' does not allow modifications.")
+            return JSONOutput.error("Reminder list '\(calendar.title)' does not allow modifications.", code: .notModifiable)
+        }
+
+        var parsedURL: URL?
+        if let url = url, !url.isEmpty {
+            guard let candidate = Self.parseURL(url) else {
+                return JSONOutput.error(Self.invalidURLMessage(url))
+            }
+            parsedURL = candidate
         }
 
         let reminder = EKReminder(eventStore: eventStore)
@@ -447,6 +660,7 @@ class EventKitManager {
         reminder.title = title
         reminder.priority = priority
         reminder.notes = notes
+        reminder.url = parsedURL
 
         if let dueDate = dueDate {
             reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
@@ -501,7 +715,7 @@ class EventKitManager {
         clearLocation: Bool = false
     ) -> JSONOutput {
         guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
-            return JSONOutput.error("Reminder not found with ID: \(reminderID)")
+            return JSONOutput.error("Reminder not found with ID: \(reminderID)", code: .notFound)
         }
 
         if clearDue && dueDate != nil {
@@ -513,8 +727,10 @@ class EventKitManager {
         }
 
         if let listID = listID {
-            guard let calendar = eventStore.calendar(withIdentifier: listID) else {
-                return JSONOutput.error("Reminder list not found with ID: \(listID)")
+            let calendar: EKCalendar
+            switch resolveReminderList(listID) {
+            case .success(let resolved): calendar = resolved
+            case .failure(let error): return JSONOutput.error(error.message, code: error.code)
             }
             guard calendar.allowedEntityTypes.contains(.reminder) else {
                 return JSONOutput.error("Calendar '\(calendar.title)' is not a reminder list.")
@@ -592,7 +808,19 @@ class EventKitManager {
     /// Marks a reminder as completed
     func completeReminder(reminderID: String) -> JSONOutput {
         guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
-            return JSONOutput.error("Reminder not found with ID: \(reminderID)")
+            return JSONOutput.error("Reminder not found with ID: \(reminderID)", code: .notFound)
+        }
+
+        // Completing an already-completed reminder must not restamp it: the original completion date
+        // is evidence of when the thing actually happened, and rewriting it moves the item back
+        // inside any recent-completion window a caller is searching.
+        guard !reminder.isCompleted else {
+            return JSONOutput.success([
+                "status": "success",
+                "message": "Reminder '\(reminder.title ?? "Untitled")' was already completed",
+                "alreadyCompleted": true,
+                "reminder": reminderToDict(reminder)
+            ])
         }
 
         reminder.isCompleted = true
@@ -613,7 +841,7 @@ class EventKitManager {
     /// Deletes a reminder
     func deleteReminder(reminderID: String) -> JSONOutput {
         guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
-            return JSONOutput.error("Reminder not found with ID: \(reminderID)")
+            return JSONOutput.error("Reminder not found with ID: \(reminderID)", code: .notFound)
         }
 
         let title = reminder.title ?? "Untitled"
