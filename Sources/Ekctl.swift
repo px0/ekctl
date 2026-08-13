@@ -79,8 +79,11 @@ struct Ekctl: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ekctl",
         abstract: "A command-line tool for managing macOS Calendar events and Reminders using EventKit.",
-        version: "1.3.0",
-        subcommands: [List.self, Show.self, Add.self, Edit.self, Delete.self, Complete.self, Alias.self],
+        version: "1.4.0",
+        subcommands: [
+            List.self, Search.self, Show.self, Add.self, Edit.self, Delete.self, Complete.self,
+            Alias.self,
+        ],
         defaultSubcommand: List.self
     )
 }
@@ -104,7 +107,7 @@ struct ListCalendars: ParsableCommand {
         let manager = EventKitManager()
         try manager.requestAccess()
         let result = manager.listCalendars()
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -138,7 +141,7 @@ struct ListEvents: ParsableCommand {
 
         let calendarID = ConfigManager.resolveAlias(calendar)
         let result = manager.listEvents(calendarID: calendarID, from: startDate, to: endDate)
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -159,7 +162,58 @@ struct ListReminders: ParsableCommand {
         try manager.requestAccess()
         let listID = ConfigManager.resolveAlias(list)
         let result = manager.listReminders(listID: listID, completed: completed)
-        print(result.toJSON())
+        try result.emit()
+    }
+}
+
+// MARK: - Search Commands
+
+struct Search: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Search across reminders.",
+        subcommands: [SearchReminders.self]
+    )
+}
+
+struct SearchReminders: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "reminders",
+        abstract: "Search reminder titles and notes across every list in one pass."
+    )
+
+    @Option(name: .long, help: "Text to look for in reminder titles and notes (case-insensitive).")
+    var query: String
+
+    @Option(name: .long, help: "Restrict the search to one reminder list (ID or alias).")
+    var list: String?
+
+    @Option(name: .long, help: "Filter by completion status (true/false).")
+    var completed: Bool?
+
+    @Option(name: .long, help: "Maximum number of matches to return.")
+    var limit: Int?
+
+    func run() throws {
+        let manager = EventKitManager()
+        try manager.requestAccess()
+
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            try JSONOutput.error("--query must not be empty.").emit()
+            return
+        }
+        if let limit = limit, limit <= 0 {
+            try JSONOutput.error("--limit must be greater than 0.").emit()
+            return
+        }
+
+        let result = manager.searchReminders(
+            query: trimmed,
+            listID: list.map { ConfigManager.resolveAlias($0) },
+            completed: completed,
+            limit: limit
+        )
+        try result.emit()
     }
 }
 
@@ -185,7 +239,7 @@ struct ShowEvent: ParsableCommand {
         let manager = EventKitManager()
         try manager.requestAccess()
         let result = manager.showEvent(eventID: eventID)
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -202,7 +256,7 @@ struct ShowReminder: ParsableCommand {
         let manager = EventKitManager()
         try manager.requestAccess()
         let result = manager.showReminder(reminderID: reminderID)
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -269,7 +323,7 @@ struct AddEvent: ParsableCommand {
             url: url,
             allDay: allDay
         )
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -329,7 +383,7 @@ struct AddReminder: ParsableCommand {
             radius: locationOptions.radius ?? EventKitManager.defaultLocationRadius,
             proximity: try locationOptions.validatedProximity() ?? .enter
         )
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -434,7 +488,7 @@ struct EditEvent: ParsableCommand {
             calendarID: calendarID,
             span: ekSpan
         )
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -520,7 +574,7 @@ struct EditReminder: ParsableCommand {
             proximity: proximity,
             clearLocation: clearLocation
         )
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -546,7 +600,7 @@ struct DeleteEvent: ParsableCommand {
         let manager = EventKitManager()
         try manager.requestAccess()
         let result = manager.deleteEvent(eventID: eventID)
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -563,7 +617,7 @@ struct DeleteReminder: ParsableCommand {
         let manager = EventKitManager()
         try manager.requestAccess()
         let result = manager.deleteReminder(reminderID: reminderID)
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -589,7 +643,7 @@ struct CompleteReminder: ParsableCommand {
         let manager = EventKitManager()
         try manager.requestAccess()
         let result = manager.completeReminder(reminderID: reminderID)
-        print(result.toJSON())
+        try result.emit()
     }
 }
 
@@ -617,14 +671,14 @@ struct AliasSet: ParsableCommand {
     func run() throws {
         do {
             try ConfigManager.setAlias(name: name, id: id)
-            print(JSONOutput.success([
+            try JSONOutput.success([
                 "status": "success",
                 "message": "Alias '\(name)' set successfully",
                 "alias": [
                     "name": name,
                     "id": id
                 ]
-            ]).toJSON())
+            ]).emit()
         } catch {
             print(JSONOutput.error("Failed to save alias: \(error.localizedDescription)").toJSON())
             throw ExitCode.failure
@@ -645,10 +699,10 @@ struct AliasRemove: ParsableCommand {
         do {
             let removed = try ConfigManager.removeAlias(name: name)
             if removed {
-                print(JSONOutput.success([
+                try JSONOutput.success([
                     "status": "success",
                     "message": "Alias '\(name)' removed successfully"
-                ]).toJSON())
+                ]).emit()
             } else {
                 print(JSONOutput.error("Alias '\(name)' not found").toJSON())
                 throw ExitCode.failure
@@ -674,10 +728,10 @@ struct AliasList: ParsableCommand {
             aliasList.append(["name": name, "id": id])
         }
 
-        print(JSONOutput.success([
+        try JSONOutput.success([
             "aliases": aliasList,
             "count": aliasList.count,
             "configPath": ConfigManager.configPath()
-        ]).toJSON())
+        ]).emit()
     }
 }

@@ -26,6 +26,22 @@ struct JSONOutput {
         ])
     }
 
+    /// Whether this receipt reports an application-level failure.
+    var isError: Bool {
+        (data["status"] as? String) == "error"
+    }
+
+    /// Prints the receipt, and fails the process when the receipt reports a failure.
+    ///
+    /// ekctl used to exit 0 while printing `{"status":"error"}`, so every caller that trusted `$?` —
+    /// a shell pipeline, a script's `set -e`, an agent's tool harness — read a failure as success.
+    /// The JSON stays the authority on *what* went wrong; the exit code exists so that silence
+    /// cannot be mistaken for success.
+    func emit() throws {
+        print(toJSON())
+        if isError { throw ExitCode.failure }
+    }
+
     /// Converts the output to a JSON string
     func toJSON() -> String {
         do {

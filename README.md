@@ -342,6 +342,21 @@ Output:
 }
 ```
 
+### Search Reminders
+
+Search titles and notes across every reminder list in a single pass — one process and one EventKit
+fetch, rather than listing each list in turn:
+
+```bash
+ekctl search reminders --query "costco"
+ekctl search reminders --query "passport" --completed false
+ekctl search reminders --query "call" --list groceries --limit 20
+```
+
+The result carries `count`, the `searchedLists` it covered, and — when `--limit` cut the result —
+`truncated: true` with `totalMatches`, so a bounded answer never reads as a complete one. Matches are
+ordered by due date, undated last.
+
 ### Show Reminder Details
 
 ```bash
@@ -632,6 +647,11 @@ Common errors:
 - `Permission denied` - Grant access in System Settings
 - `Calendar not found` - Check the calendar ID with `list calendars`
 - `Invalid date format` - Use ISO 8601 format (see examples above)
+
+**An error exits non-zero.** Every command that prints `{"status":"error"}` exits 1, so `set -e`,
+`&&` chains, and tool harnesses see the failure without parsing anything. The JSON remains the
+authority on *what* failed — the exit code only ensures a failure cannot pass for success. Before
+1.4.0 every command exited 0 regardless, so a script that checked `$?` silently accepted errors.
 
 ## Help
 
