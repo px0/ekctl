@@ -6,6 +6,7 @@ A native macOS command-line tool for managing Calendar events and Reminders usin
 
 - List, create, edit, and delete calendar events
 - List, create, edit, complete, and delete reminders
+- **Location triggers** on reminders — geocoded geofences that fire on arrival or departure
 - **Calendar aliases** - Use friendly names instead of long IDs
 - JSON output for easy parsing and scripting
 - Full EventKit integration with proper permission handling
@@ -333,7 +334,8 @@ Output:
       "dueDate": "2026-01-20T17:00:00Z",
       "completed": false,
       "priority": 0,
-      "notes": null
+      "notes": null,
+      "locationTrigger": null
     }
   ],
   "status": "success"
@@ -370,7 +372,24 @@ ekctl add reminder \
   --due "2026-02-01T12:00:00Z" \
   --priority 1 \
   --notes "Check expiration date first"
+
+# Reminder that fires when you arrive at a place
+ekctl add reminder \
+  --list groceries \
+  --title "Pick up the prescription" \
+  --location "20500 Stevens Creek Blvd, Cupertino, CA" \
+  --radius 200
+
+# ...or when you leave one
+ekctl add reminder \
+  --list personal \
+  --title "Text home that I'm on my way" \
+  --location "San Francisco International Airport" \
+  --proximity depart
 ```
+
+See [Location Triggers](#location-triggers) for how the place is resolved and when to pin
+coordinates yourself.
 
 Output:
 ```json
@@ -410,6 +429,12 @@ ekctl edit reminder "REM123-456-789" --clear-due
 
 # Move to another reminder list (ID or alias)
 ekctl edit reminder "REM123-456-789" --list groceries
+
+# Set, move, or drop the location trigger
+ekctl edit reminder "REM123-456-789" --location "1 Infinite Loop, Cupertino, CA"
+ekctl edit reminder "REM123-456-789" --radius 400          # keeps the place and proximity
+ekctl edit reminder "REM123-456-789" --proximity depart
+ekctl edit reminder "REM123-456-789" --clear-location      # drops the fence, keeps time alarms
 ```
 
 Output:
@@ -438,6 +463,67 @@ Passing both `--due` and `--clear-due` is rejected rather than guessed:
   "status": "error",
   "error": "Cannot specify both --due and --clear-due."
 }
+```
+
+`--clear-location` combined with any other location option is rejected the same way. `--radius` or
+`--proximity` on their own adjust the existing trigger and fail on a reminder that has none.
+
+### Location Triggers
+
+A location reminder fires because EventKit registers a geofence around a **coordinate**. The place
+name stored alongside it is only a label: nothing in Reminders.app resolves it later. So `--location`
+is geocoded at write time, and a place that cannot be resolved is an error rather than a reminder
+that displays an address and never goes off.
+
+```bash
+# Geocoded: the response tells you what the geocoder matched
+ekctl add reminder --list personal --title "Buy stamps" --location "US Post Office, Cupertino, CA"
+```
+```json
+{
+  "status": "success",
+  "message": "Reminder created successfully",
+  "geocodedTo": "21701 Stevens Creek Blvd, Cupertino, CA 95014, United States",
+  "reminder": {
+    "id": "NEWREM-123-456",
+    "title": "Buy stamps",
+    "locationTrigger": {
+      "title": "US Post Office, Cupertino, CA",
+      "radius": 100,
+      "proximity": "arrive",
+      "latitude": 37.3230,
+      "longitude": -122.0322
+    }
+  }
+}
+```
+
+**Read `geocodedTo` before trusting the fence.** Apple's geocoder answers vague or garbled input with
+a confident match somewhere else: `--location "qqzzxx not a real place 12345"` succeeds, landing in
+Schenectady, NY, because of the ZIP code. Give it a full street address when you have one, and check
+the city it echoes back.
+
+When a place has no postal address — a backyard, a trailhead, a parking lot — pin it yourself and
+skip the lookup entirely. Both coordinates are required together, along with a `--location` label:
+
+```bash
+ekctl add reminder --list personal --title "Water the tomatoes" \
+  --location "Backyard" --latitude 43.6883577 --longitude -79.3142972
+```
+
+Options: `--radius` is meters (default 100; `0` hands the choice to Reminders, which is what the app
+itself stores), and `--proximity` is `arrive` or `depart` — a typo is rejected rather than silently
+treated as `arrive`.
+
+Reads report the trigger too, as `locationTrigger` on every reminder (`null` when there is none).
+A trigger written by ekctl before 1.3.0 has no usable coordinate; it reads back with
+`"unresolved": true` and null coordinates, and `ekctl edit reminder <id> --radius 100` re-geocodes
+it in place. To find them:
+
+```bash
+for id in $(ekctl list calendars | jq -r '.calendars[]|select(.type=="reminder").id'); do
+  ekctl list reminders --list "$id" | jq -c '.reminders[]? | select(.locationTrigger.unresolved) | {id, title, locationTrigger}'
+done
 ```
 
 ### Complete Reminder

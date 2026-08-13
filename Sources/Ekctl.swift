@@ -1,6 +1,76 @@
 import ArgumentParser
+import CoreLocation
 import EventKit
 import Foundation
+
+// MARK: - Location Trigger Options
+
+/// The location-trigger flags shared by `add reminder` and `edit reminder`, plus the validation both
+/// need. Coordinates are resolved from `--location` by geocoding unless the caller pins them here.
+struct LocationOptions: ParsableArguments {
+    @Option(name: .long, help: "Place name or address that triggers the reminder (e.g. '1 Infinite Loop, Cupertino, CA'). Geocoded to a coordinate so the geofence actually fires.")
+    var location: String?
+
+    @Option(name: .long, help: "Location trigger radius in meters (default: 100; 0 lets Reminders pick, which is what the app itself does).")
+    var radius: Double?
+
+    @Option(name: .long, help: "Location trigger: 'arrive' or 'depart' (default: arrive).")
+    var proximity: String?
+
+    // .unconditional so a western-hemisphere longitude like -79.31 is read as a value rather than
+    // mistaken for a flag.
+    @Option(name: .long, parsing: .unconditional, help: "Latitude to pin the trigger to, skipping the address lookup. Requires --longitude.")
+    var latitude: Double?
+
+    @Option(name: .long, parsing: .unconditional, help: "Longitude to pin the trigger to, skipping the address lookup. Requires --latitude.")
+    var longitude: Double?
+
+    /// True when the caller asked for anything location-related at all.
+    var isPresent: Bool {
+        location != nil || radius != nil || proximity != nil || latitude != nil || longitude != nil
+    }
+
+    /// Validates the combination and returns the explicit coordinate, if one was given.
+    /// Prints the JSON error and throws on bad input, matching the rest of the CLI.
+    func validatedCoordinate() throws -> CLLocationCoordinate2D? {
+        // 0 is meaningful: it is what Reminders.app stores when it wants to choose the radius itself.
+        if let radius = radius, radius < 0 {
+            print(JSONOutput.error("--radius cannot be negative (meters; 0 lets Reminders pick).").toJSON())
+            throw ExitCode.failure
+        }
+
+        _ = try validatedProximity()
+
+        switch (latitude, longitude) {
+        case (nil, nil):
+            return nil
+        case (let lat?, let lon?):
+            guard (-90...90).contains(lat), (-180...180).contains(lon) else {
+                print(JSONOutput.error("--latitude must be within -90…90 and --longitude within -180…180.").toJSON())
+                throw ExitCode.failure
+            }
+            return CLLocationCoordinate2D(latitude: lat, longitude: lon)
+        default:
+            print(JSONOutput.error("--latitude and --longitude must be given together.").toJSON())
+            throw ExitCode.failure
+        }
+    }
+
+    /// Parses `--proximity`, rejecting anything that is not 'arrive' or 'depart' rather than
+    /// quietly treating a typo as 'arrive'.
+    func validatedProximity() throws -> EKAlarmProximity? {
+        guard let proximity = proximity else { return nil }
+        switch proximity.lowercased() {
+        case "arrive":
+            return .enter
+        case "depart":
+            return .leave
+        default:
+            print(JSONOutput.error("Invalid --proximity value '\(proximity)'. Use 'arrive' or 'depart'.").toJSON())
+            throw ExitCode.failure
+        }
+    }
+}
 
 // MARK: - Main Command
 
@@ -9,7 +79,7 @@ struct Ekctl: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ekctl",
         abstract: "A command-line tool for managing macOS Calendar events and Reminders using EventKit.",
-        version: "1.2.0",
+        version: "1.3.0",
         subcommands: [List.self, Show.self, Add.self, Edit.self, Delete.self, Complete.self, Alias.self],
         defaultSubcommand: List.self
     )
@@ -224,14 +294,7 @@ struct AddReminder: ParsableCommand {
     @Option(name: .long, help: "Optional notes.")
     var notes: String?
 
-    @Option(name: .long, help: "Optional location name or address to trigger reminder (e.g. '1 Infinite Loop, Cupertino, CA').")
-    var location: String?
-
-    @Option(name: .long, help: "Location trigger radius in meters (default: 100).")
-    var radius: Double?
-
-    @Option(name: .long, help: "Location trigger: 'arrive' or 'depart' (default: arrive).")
-    var proximity: String?
+    @OptionGroup var locationOptions: LocationOptions
 
     func run() throws {
         let manager = EventKitManager()
@@ -246,6 +309,14 @@ struct AddReminder: ParsableCommand {
             dueDate = parsed
         }
 
+        let coordinate = try locationOptions.validatedCoordinate()
+        if locationOptions.location == nil && locationOptions.isPresent {
+            print(JSONOutput.error(
+                "--radius/--proximity/--latitude/--longitude only apply to a trigger — pass --location too."
+            ).toJSON())
+            throw ExitCode.failure
+        }
+
         let listID = ConfigManager.resolveAlias(list)
         let result = manager.addReminder(
             listID: listID,
@@ -253,9 +324,10 @@ struct AddReminder: ParsableCommand {
             dueDate: dueDate,
             priority: priority ?? 0,
             notes: notes,
-            location: location,
-            radius: radius ?? 100,
-            proximity: proximity ?? "arrive"
+            location: locationOptions.location,
+            coordinate: coordinate,
+            radius: locationOptions.radius ?? EventKitManager.defaultLocationRadius,
+            proximity: try locationOptions.validatedProximity() ?? .enter
         )
         print(result.toJSON())
     }
@@ -393,14 +465,28 @@ struct EditReminder: ParsableCommand {
     @Option(name: .long, help: "Move the reminder to another reminder list (ID or alias).")
     var list: String?
 
+    @OptionGroup var locationOptions: LocationOptions
+
+    @Flag(name: .long, help: "Remove the location trigger, leaving time alarms alone.")
+    var clearLocation: Bool = false
+
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
 
-        guard title != nil || due != nil || clearDue || priority != nil || notes != nil || list != nil else {
+        guard title != nil || due != nil || clearDue || priority != nil || notes != nil || list != nil
+            || locationOptions.isPresent || clearLocation else {
             print(JSONOutput.error(
-                "Nothing to change — pass at least one of --title/--due/--clear-due/--priority/--notes/--list"
+                "Nothing to change — pass at least one of --title/--due/--clear-due/--priority/--notes/--list/--location/--radius/--proximity/--clear-location"
             ).toJSON())
+            throw ExitCode.failure
+        }
+
+        let coordinate = try locationOptions.validatedCoordinate()
+        let proximity = try locationOptions.validatedProximity()
+
+        if clearLocation && locationOptions.isPresent {
+            print(JSONOutput.error("Cannot specify both --clear-location and other location options.").toJSON())
             throw ExitCode.failure
         }
 
@@ -427,7 +513,12 @@ struct EditReminder: ParsableCommand {
             clearDue: clearDue,
             priority: priority,
             notes: notes,
-            listID: listID
+            listID: listID,
+            location: locationOptions.location,
+            coordinate: coordinate,
+            radius: locationOptions.radius,
+            proximity: proximity,
+            clearLocation: clearLocation
         )
         print(result.toJSON())
     }

@@ -1,4 +1,5 @@
 import ArgumentParser
+import CoreLocation
 import EventKit
 import Foundation
 
@@ -358,8 +359,9 @@ class EventKitManager {
         priority: Int,
         notes: String?,
         location: String? = nil,
-        radius: Double = 100,
-        proximity: String = "arrive"
+        coordinate: CLLocationCoordinate2D? = nil,
+        radius: Double = EventKitManager.defaultLocationRadius,
+        proximity: EKAlarmProximity = .enter
     ) -> JSONOutput {
         guard let calendar = eventStore.calendar(withIdentifier: listID) else {
             return JSONOutput.error("Reminder list not found with ID: \(listID)")
@@ -379,23 +381,33 @@ class EventKitManager {
             reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
         }
 
+        var matchedAddress: String?
         if let locationName = location {
-            let structuredLocation = EKStructuredLocation(title: locationName)
-            structuredLocation.radius = radius
-
-            let alarm = EKAlarm()
-            alarm.structuredLocation = structuredLocation
-            alarm.proximity = (proximity.lowercased() == "depart") ? .leave : .enter
-            reminder.addAlarm(alarm)
+            switch makeLocationAlarm(
+                title: locationName,
+                radius: radius,
+                proximity: proximity,
+                coordinate: coordinate
+            ) {
+            case .success(let built):
+                reminder.addAlarm(built.alarm)
+                matchedAddress = built.matchedAddress
+            case .failure(let failure):
+                return JSONOutput.error(failure.message)
+            }
         }
 
         do {
             try eventStore.save(reminder, commit: true)
-            return JSONOutput.success([
+            var payload: [String: Any] = [
                 "status": "success",
                 "message": "Reminder created successfully",
                 "reminder": reminderToDict(reminder)
-            ])
+            ]
+            if let matchedAddress = matchedAddress {
+                payload["geocodedTo"] = matchedAddress
+            }
+            return JSONOutput.success(payload)
         } catch {
             return JSONOutput.error("Failed to create reminder: \(error.localizedDescription)")
         }
@@ -410,7 +422,12 @@ class EventKitManager {
         clearDue: Bool,
         priority: Int?,
         notes: String?,
-        listID: String?
+        listID: String?,
+        location: String? = nil,
+        coordinate: CLLocationCoordinate2D? = nil,
+        radius: Double? = nil,
+        proximity: EKAlarmProximity? = nil,
+        clearLocation: Bool = false
     ) -> JSONOutput {
         guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
             return JSONOutput.error("Reminder not found with ID: \(reminderID)")
@@ -418,6 +435,10 @@ class EventKitManager {
 
         if clearDue && dueDate != nil {
             return JSONOutput.error("Cannot specify both a due date and --clear-due.")
+        }
+
+        if clearLocation && (location != nil || coordinate != nil || radius != nil || proximity != nil) {
+            return JSONOutput.error("Cannot specify both --clear-location and other location options.")
         }
 
         if let listID = listID {
@@ -446,13 +467,52 @@ class EventKitManager {
             reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
         }
 
+        var matchedAddress: String?
+        if clearLocation {
+            removeLocationAlarms(from: reminder)
+        } else if location != nil || coordinate != nil || radius != nil || proximity != nil {
+            // A trigger is rebuilt rather than mutated in place: the values not being changed are
+            // read off the existing alarm, so `--radius` alone keeps the place, and an old trigger
+            // stored without a coordinate is re-geocoded and starts working.
+            let existing = locationAlarm(of: reminder)
+            let existingLocation = existing?.structuredLocation
+
+            guard let title = location ?? existingLocation?.title else {
+                return JSONOutput.error(
+                    "This reminder has no location trigger to adjust — pass --location as well."
+                )
+            }
+
+            let existingCoordinate = existingLocation.flatMap { fencedCoordinate(of: $0) }
+            let radiusToUse = radius ?? existingLocation?.radius ?? Self.defaultLocationRadius
+
+            switch makeLocationAlarm(
+                title: title,
+                radius: radiusToUse,
+                proximity: proximity ?? existing?.proximity ?? .enter,
+                // Re-geocode when the place itself changed; otherwise keep the coordinate we have.
+                coordinate: coordinate ?? (location == nil ? existingCoordinate : nil)
+            ) {
+            case .success(let built):
+                removeLocationAlarms(from: reminder)
+                reminder.addAlarm(built.alarm)
+                matchedAddress = built.matchedAddress
+            case .failure(let failure):
+                return JSONOutput.error(failure.message)
+            }
+        }
+
         do {
             try eventStore.save(reminder, commit: true)
-            return JSONOutput.success([
+            var payload: [String: Any] = [
                 "status": "success",
                 "message": "Reminder updated successfully",
                 "reminder": reminderToDict(reminder)
-            ])
+            ]
+            if let matchedAddress = matchedAddress {
+                payload["geocodedTo"] = matchedAddress
+            }
+            return JSONOutput.success(payload)
         } catch {
             return JSONOutput.error("Failed to update reminder: \(error.localizedDescription)")
         }
@@ -496,6 +556,77 @@ class EventKitManager {
             ])
         } catch {
             return JSONOutput.error("Failed to delete reminder: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Location Triggers
+
+    /// Radius used when the caller does not name one. Below roughly this distance a geofence fires
+    /// unreliably, so it is also the smallest value worth defaulting to.
+    static let defaultLocationRadius: Double = 100
+
+    /// Builds the alarm that makes a reminder fire on arrival at or departure from a place.
+    ///
+    /// EventKit stores a location trigger as an alarm carrying a structured location. That location
+    /// needs a coordinate to become a geofence — a title alone produces a reminder that shows an
+    /// address and never fires — so an unresolvable place is an error rather than a silent
+    /// half-trigger.
+    private func makeLocationAlarm(
+        title: String,
+        radius: Double,
+        proximity: EKAlarmProximity,
+        coordinate: CLLocationCoordinate2D?
+    ) -> Result<(alarm: EKAlarm, matchedAddress: String?), LocationResolver.Failure> {
+        let resolved: CLLocation
+        var matchedAddress: String?
+        if let coordinate = coordinate {
+            resolved = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        } else {
+            switch LocationResolver.resolve(title) {
+            case .success(let place):
+                resolved = place.location
+                matchedAddress = place.matchedAddress
+            case .failure(let failure):
+                return .failure(LocationResolver.Failure(
+                    message: "\(failure.message) Pass --latitude and --longitude to set the trigger without a lookup."
+                ))
+            }
+        }
+
+        let structuredLocation = EKStructuredLocation(title: title)
+        structuredLocation.geoLocation = resolved
+        structuredLocation.radius = radius
+
+        let alarm = EKAlarm()
+        alarm.structuredLocation = structuredLocation
+        alarm.proximity = proximity
+        return .success((alarm, matchedAddress))
+    }
+
+    /// The reminder's location trigger, if it has one. Time alarms are left out.
+    private func locationAlarm(of reminder: EKReminder) -> EKAlarm? {
+        reminder.alarms?.first { $0.structuredLocation != nil }
+    }
+
+    /// The coordinate a structured location actually fences, or nil when it fences nothing.
+    ///
+    /// A structured location built from a title alone reads back as latitude 0, longitude 0 rather
+    /// than as a missing coordinate — a point in the Gulf of Guinea, so the reminder never fires.
+    /// Treating that as "no coordinate" is what lets such a trigger be reported as broken and
+    /// re-geocoded on edit.
+    private func fencedCoordinate(of location: EKStructuredLocation) -> CLLocationCoordinate2D? {
+        guard let coordinate = location.geoLocation?.coordinate,
+              CLLocationCoordinate2DIsValid(coordinate),
+              !(coordinate.latitude == 0 && coordinate.longitude == 0) else {
+            return nil
+        }
+        return coordinate
+    }
+
+    /// Drops every location trigger, leaving any time-based alarms in place.
+    private func removeLocationAlarms(from reminder: EKReminder) {
+        for alarm in reminder.alarms ?? [] where alarm.structuredLocation != nil {
+            reminder.removeAlarm(alarm)
         }
     }
 
@@ -591,6 +722,26 @@ class EventKitManager {
 
         if let url = reminder.url {
             dict["url"] = url.absoluteString
+        }
+
+        if let alarm = locationAlarm(of: reminder), let location = alarm.structuredLocation {
+            var trigger: [String: Any] = [
+                "title": location.title ?? "",
+                "radius": location.radius,
+                "proximity": alarm.proximity == .leave ? "depart" : "arrive"
+            ]
+            if let coordinate = fencedCoordinate(of: location) {
+                trigger["latitude"] = coordinate.latitude
+                trigger["longitude"] = coordinate.longitude
+            } else {
+                // No coordinate means no geofence: the reminder will never fire on location.
+                trigger["latitude"] = NSNull()
+                trigger["longitude"] = NSNull()
+                trigger["unresolved"] = true
+            }
+            dict["locationTrigger"] = trigger
+        } else {
+            dict["locationTrigger"] = NSNull()
         }
 
         return dict
