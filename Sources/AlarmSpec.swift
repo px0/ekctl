@@ -58,6 +58,10 @@ enum AlarmSpec: Equatable {
             body = body.dropFirst()
         }
 
+        // Zero is the one magnitude that needs no unit, because every unit of it is the same
+        // instant: the alarm fires at the due date or start itself.
+        if let zero = Double(body), zero == 0 { return .success(.relative(0)) }
+
         guard let unit = units.first(where: { body.hasSuffix($0.suffix) }) else {
             // A bare number cannot be honoured by guessing a unit: '15' meaning seconds when the
             // caller meant minutes is a silently wrong alarm, which is worse than a refusal.
