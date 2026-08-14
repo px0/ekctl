@@ -6,6 +6,7 @@ A native macOS command-line tool for managing Calendar events and Reminders usin
 
 - List, create, edit, and delete calendar events
 - List, create, edit, complete, and delete reminders
+- **Alarms** on both events and reminders — relative offsets or absolute instants, on every add and edit verb
 - **Location triggers** on reminders — geocoded geofences that fire on arrival or departure
 - **Cross-list reminder search**, bounded by completion age so it stays fast
 - Create and delete reminder lists; address any list by ID, alias, or title
@@ -291,6 +292,55 @@ If you don't pass any field to change:
 }
 ```
 
+### Alarms
+
+`--alarm` attaches a notification, and works on `add event`, `edit event`, `add reminder` and
+`edit reminder`. A value is either an offset or an absolute ISO8601 instant:
+
+```bash
+# 15 minutes before. An unsigned offset means "before", which is how people say it out loud;
+# '+10m' fires after, and '0' fires at the time itself. Units are s/m/h/d/w.
+ekctl add event --calendar work --title "Dentist" \
+  --start 2026-08-20T13:00:00Z --end 2026-08-20T14:00:00Z --alarm 15m
+
+# Repeat the flag for several. This one warns a day ahead and again half an hour before.
+ekctl add event --calendar work --title "Flight" \
+  --start 2026-09-01T11:00:00Z --end 2026-09-01T15:00:00Z --alarm 1d --alarm 30m
+
+# An absolute instant, for an alarm that is not tied to the item's own time.
+ekctl add reminder --list Todo --title "Renew passport" \
+  --due 2026-09-30T09:00:00Z --alarm 2026-09-15T09:00:00Z
+```
+
+An offset counts from an event's start and from a reminder's due date. A relative alarm on a
+reminder with no due date has nothing to be relative to and is refused rather than stored as
+something that can never fire.
+
+On an edit, the alarms you pass **replace** the existing ones rather than adding to them, so the
+flag describes the resulting state the way every other option on these commands does. `--clear-alarms`
+removes them all:
+
+```bash
+ekctl edit event "ABC123:DEF456" --alarm 5m        # now exactly one alarm, 5 minutes before
+ekctl edit reminder "REM-123" --clear-alarms       # no time alarms
+```
+
+Time alarms and location triggers are independent. `--clear-alarms` leaves a reminder's location
+trigger in place, and `--clear-location` leaves its time alarms in place.
+
+Every read reports what is actually stored, under `alarms`:
+
+```json
+"alarms": [
+  { "type": "relative", "offsetSeconds": -900, "offset": "15 minutes before" },
+  { "type": "absolute", "at": "2026-09-15T05:00:00-04:00" }
+]
+```
+
+For reminders `alarms` holds time alarms only — the location trigger keeps its own `locationTrigger`
+field, since it is authored and cleared by its own flags. For events, which have no separate field
+for one, a location alarm appears in `alarms` with `"type": "location"`.
+
 ### Delete Event
 
 ```bash
@@ -473,6 +523,14 @@ ekctl edit reminder "REM123-456-789" --location "1 Infinite Loop, Cupertino, CA"
 ekctl edit reminder "REM123-456-789" --radius 400          # keeps the place and proximity
 ekctl edit reminder "REM123-456-789" --proximity depart
 ekctl edit reminder "REM123-456-789" --clear-location      # drops the fence, keeps time alarms
+
+# Set or clear the URL. An empty string clears it.
+ekctl edit reminder "REM123-456-789" --url "https://example.com/thread/42"
+ekctl edit reminder "REM123-456-789" --url ""
+
+# Alarms, replacing whatever was there
+ekctl edit reminder "REM123-456-789" --alarm 1h
+ekctl edit reminder "REM123-456-789" --clear-alarms        # drops time alarms, keeps the fence
 ```
 
 Output:

@@ -174,7 +174,8 @@ class EventKitManager {
         location: String?,
         notes: String?,
         url: String?,
-        allDay: Bool
+        allDay: Bool,
+        alarms: [AlarmSpec] = []
     ) -> JSONOutput {
         guard let calendar = eventStore.calendar(withIdentifier: calendarID) else {
             return JSONOutput.error("Calendar not found with ID: \(calendarID)", code: .notFound)
@@ -201,6 +202,7 @@ class EventKitManager {
         event.notes = notes
         event.url = parsedURL
         event.isAllDay = allDay
+        applyTimeAlarms(alarms, clear: false, to: event)
 
         do {
             try eventStore.save(event, span: .thisEvent)
@@ -226,7 +228,9 @@ class EventKitManager {
         url: String?,
         allDay: Bool?,
         calendarID: String?,
-        span: EKSpan
+        span: EKSpan,
+        alarms: [AlarmSpec] = [],
+        clearAlarms: Bool = false
     ) -> JSONOutput {
         guard let event = eventStore.event(withIdentifier: eventID) else {
             return JSONOutput.error("Event not found with ID: \(eventID)", code: .notFound)
@@ -278,6 +282,7 @@ class EventKitManager {
         if let allDay = allDay {
             event.isAllDay = allDay
         }
+        applyTimeAlarms(alarms, clear: clearAlarms, to: event)
 
         do {
             try eventStore.save(event, span: span, commit: true)
@@ -635,8 +640,12 @@ class EventKitManager {
         location: String? = nil,
         coordinate: CLLocationCoordinate2D? = nil,
         radius: Double = EventKitManager.defaultLocationRadius,
-        proximity: EKAlarmProximity = .enter
+        proximity: EKAlarmProximity = .enter,
+        alarms: [AlarmSpec] = []
     ) -> JSONOutput {
+        if let refusal = rejectUndatedRelativeAlarms(alarms, hasDueDate: dueDate != nil) {
+            return refusal
+        }
         let calendar: EKCalendar
         switch resolveReminderList(listID) {
         case .success(let resolved): calendar = resolved
@@ -665,6 +674,7 @@ class EventKitManager {
         if let dueDate = dueDate {
             reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
         }
+        applyTimeAlarms(alarms, clear: false, to: reminder)
 
         var matchedAddress: String?
         if let locationName = location {
@@ -712,7 +722,10 @@ class EventKitManager {
         coordinate: CLLocationCoordinate2D? = nil,
         radius: Double? = nil,
         proximity: EKAlarmProximity? = nil,
-        clearLocation: Bool = false
+        clearLocation: Bool = false,
+        url: String? = nil,
+        alarms: [AlarmSpec] = [],
+        clearAlarms: Bool = false
     ) -> JSONOutput {
         guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
             return JSONOutput.error("Reminder not found with ID: \(reminderID)", code: .notFound)
@@ -724,6 +737,31 @@ class EventKitManager {
 
         if clearLocation && (location != nil || coordinate != nil || radius != nil || proximity != nil) {
             return JSONOutput.error("Cannot specify both --clear-location and other location options.")
+        }
+
+        if clearAlarms && !alarms.isEmpty {
+            return JSONOutput.error("Cannot specify both --clear-alarms and --alarm.")
+        }
+
+        // A relative alarm is measured from the due date the reminder will have once this edit is
+        // applied, not the one it has now — so a single call may legitimately add both.
+        let willHaveDueDate = clearDue ? false : (dueDate != nil || reminder.dueDateComponents != nil)
+        if let refusal = rejectUndatedRelativeAlarms(alarms, hasDueDate: willHaveDueDate) {
+            return refusal
+        }
+
+        // Resolve the URL before touching the reminder, so a late validation failure cannot leave
+        // the other fields already applied in memory. Outer nil = not passed, inner nil = cleared.
+        var resolvedURL: URL??
+        if let url = url {
+            if url.isEmpty {
+                resolvedURL = .some(nil)
+            } else {
+                guard let candidate = Self.parseURL(url) else {
+                    return JSONOutput.error(Self.invalidURLMessage(url))
+                }
+                resolvedURL = .some(candidate)
+            }
         }
 
         if let listID = listID {
@@ -747,12 +785,16 @@ class EventKitManager {
         if let notes = notes {
             reminder.notes = notes
         }
+        if let resolvedURL = resolvedURL {
+            reminder.url = resolvedURL
+        }
 
         if clearDue {
             reminder.dueDateComponents = nil
         } else if let dueDate = dueDate {
             reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
         }
+        applyTimeAlarms(alarms, clear: clearAlarms, to: reminder)
 
         var matchedAddress: String?
         if clearLocation {
@@ -929,6 +971,48 @@ class EventKitManager {
         }
     }
 
+    // MARK: - Time alarms
+
+    /// Applies `--alarm`/`--clear-alarms` to a calendar item, leaving location triggers untouched.
+    ///
+    /// Supplying alarms **replaces** the existing time alarms rather than adding to them. Appending
+    /// would be the more literal reading of the flag, but it gives no way to remove one alarm and
+    /// makes an edit repeated twice silently double the notifications; replacement means the flag
+    /// describes the resulting state, which is how every other option on these commands behaves.
+    private func applyTimeAlarms(
+        _ specs: [AlarmSpec], clear: Bool, to item: EKCalendarItem
+    ) {
+        guard clear || !specs.isEmpty else { return }
+        for alarm in item.alarms ?? [] where alarm.isTimeAlarm {
+            item.removeAlarm(alarm)
+        }
+        for spec in specs {
+            item.addAlarm(spec.alarm())
+        }
+    }
+
+    /// A relative alarm on a reminder with no due date is stored happily and can never fire, because
+    /// there is no instant for the offset to be relative to. Refusing it is the difference between
+    /// an error the caller can act on and a reminder that silently never notifies.
+    private func rejectUndatedRelativeAlarms(
+        _ specs: [AlarmSpec], hasDueDate: Bool
+    ) -> JSONOutput? {
+        guard !hasDueDate, specs.contains(where: \.isRelative) else { return nil }
+        return JSONOutput.error(
+            "A relative alarm needs a due date to be relative to. Pass --due as well, or give the "
+                + "alarm as an absolute ISO8601 instant.",
+            code: .invalidInput
+        )
+    }
+
+    /// The time alarms of an item, described for JSON output.
+    private func timeAlarms(of item: EKCalendarItem) -> [[String: Any]] {
+        let formatter = localDateFormatter()
+        return (item.alarms ?? [])
+            .filter { $0.isTimeAlarm }
+            .map { $0.describedForOutput(using: formatter) }
+    }
+
     // MARK: - Helper Methods
 
     /// Converts a due date into the date components EventKit expects for a reminder's due date.
@@ -982,6 +1066,10 @@ class EventKitManager {
         }
 
         dict["hasAlarms"] = event.hasAlarms
+        // `hasAlarms` answers "are there any"; this answers "which", which is what a caller deciding
+        // whether to add or replace one actually needs. Location triggers appear here too, since an
+        // event has no separate field for them the way a reminder does.
+        dict["alarms"] = (event.alarms ?? []).map { $0.describedForOutput(using: formatter) }
         dict["hasRecurrenceRules"] = event.hasRecurrenceRules
 
         return dict
@@ -1022,6 +1110,11 @@ class EventKitManager {
         if let url = reminder.url {
             dict["url"] = url.absoluteString
         }
+
+        // Time alarms only: the location trigger keeps its own `locationTrigger` field below,
+        // because it is authored and cleared by its own flags. Listing it in both places would make
+        // `--clear-alarms` look as though it should remove it.
+        dict["alarms"] = timeAlarms(of: reminder)
 
         if let alarm = locationAlarm(of: reminder), let location = alarm.structuredLocation {
             var trigger: [String: Any] = [

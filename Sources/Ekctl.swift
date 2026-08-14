@@ -72,6 +72,53 @@ struct LocationOptions: ParsableArguments {
     }
 }
 
+// MARK: - Alarm Options
+
+/// The `--alarm`/`--clear-alarms` flags shared by every add and edit verb.
+///
+/// `--alarm` may be repeated to set several. On an edit it describes the resulting state rather than
+/// adding to what is there, matching every other option on these commands: the alternative leaves no
+/// way to remove one alarm, and makes running the same edit twice double the notifications.
+struct AlarmOptions: ParsableArguments {
+    // .unconditionalSingleValue so a leading '-' in '-15m' is read as a sign rather than as the
+    // start of another flag.
+    @Option(
+        name: .long,
+        parsing: .unconditionalSingleValue,
+        help: """
+            Notification to attach. Either an offset — '15m', '-1h', '2d' fire before, '+10m' after, \
+            '0' at the time — or an absolute ISO8601 instant. Offsets count from an event's start \
+            and from a reminder's due date. Repeat to set several; on an edit the set you pass \
+            replaces the existing alarms.
+            """
+    )
+    var alarm: [String] = []
+
+    @Flag(name: .long, help: "Remove existing time alarms. A location trigger is left alone; use --clear-location for that.")
+    var clearAlarms: Bool = false
+
+    var isPresent: Bool { !alarm.isEmpty || clearAlarms }
+
+    /// Parses every `--alarm`, printing the JSON error and throwing on the first bad one, so a typo
+    /// surfaces before anything is written rather than as a silently missing notification.
+    func validated() throws -> [AlarmSpec] {
+        if clearAlarms && !alarm.isEmpty {
+            print(JSONOutput.error("Cannot specify both --clear-alarms and --alarm.").toJSON())
+            throw ExitCode.failure
+        }
+        var specs: [AlarmSpec] = []
+        for raw in alarm {
+            switch AlarmSpec.parse(raw) {
+            case .success(let spec): specs.append(spec)
+            case .failure(let failure):
+                print(JSONOutput.error(failure.message, code: .invalidInput).toJSON())
+                throw ExitCode.failure
+            }
+        }
+        return specs
+    }
+}
+
 // MARK: - Main Command
 
 @main
@@ -79,7 +126,7 @@ struct Ekctl: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ekctl",
         abstract: "A command-line tool for managing macOS Calendar events and Reminders using EventKit.",
-        version: "1.5.0",
+        version: "1.6.0",
         subcommands: [
             List.self, Search.self, Show.self, Add.self, Edit.self, Delete.self, Complete.self,
             Alias.self,
@@ -337,9 +384,17 @@ struct AddEvent: ParsableCommand {
     @Flag(name: .long, help: "Mark as all-day event.")
     var allDay: Bool = false
 
+    @OptionGroup var alarmOptions: AlarmOptions
+
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
+
+        if alarmOptions.clearAlarms {
+            print(JSONOutput.error("--clear-alarms applies to an edit; a new event has no alarms to clear.").toJSON())
+            throw ExitCode.failure
+        }
+        let alarms = try alarmOptions.validated()
 
         guard let startDate = ISO8601DateFormatter().date(from: start) else {
             print(JSONOutput.error("Invalid --start date format. Use ISO8601.").toJSON())
@@ -359,7 +414,8 @@ struct AddEvent: ParsableCommand {
             location: location,
             notes: notes,
             url: url,
-            allDay: allDay
+            allDay: allDay,
+            alarms: alarms
         )
         try result.emit()
     }
@@ -391,9 +447,17 @@ struct AddReminder: ParsableCommand {
 
     @OptionGroup var locationOptions: LocationOptions
 
+    @OptionGroup var alarmOptions: AlarmOptions
+
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
+
+        if alarmOptions.clearAlarms {
+            print(JSONOutput.error("--clear-alarms applies to an edit; a new reminder has no alarms to clear.").toJSON())
+            throw ExitCode.failure
+        }
+        let alarms = try alarmOptions.validated()
 
         var dueDate: Date?
         if let due = due {
@@ -423,7 +487,8 @@ struct AddReminder: ParsableCommand {
             location: locationOptions.location,
             coordinate: coordinate,
             radius: locationOptions.radius ?? EventKitManager.defaultLocationRadius,
-            proximity: try locationOptions.validatedProximity() ?? .enter
+            proximity: try locationOptions.validatedProximity() ?? .enter,
+            alarms: alarms
         )
         try result.emit()
     }
@@ -475,9 +540,13 @@ struct EditEvent: ParsableCommand {
     @Option(name: .long, help: "Which occurrences to apply the edit to for recurring events: 'thisEvent' or 'futureEvents' (default: thisEvent).")
     var span: String?
 
+    @OptionGroup var alarmOptions: AlarmOptions
+
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
+
+        let alarms = try alarmOptions.validated()
 
         var startDate: Date?
         if let start = start {
@@ -498,9 +567,10 @@ struct EditEvent: ParsableCommand {
         }
 
         guard title != nil || startDate != nil || endDate != nil || location != nil
-            || notes != nil || url != nil || allDay != nil || calendar != nil else {
+            || notes != nil || url != nil || allDay != nil || calendar != nil
+            || alarmOptions.isPresent else {
             print(JSONOutput.error(
-                "Nothing to change — pass at least one of --title/--start/--end/--location/--notes/--url/--all-day/--calendar"
+                "Nothing to change — pass at least one of --title/--start/--end/--location/--notes/--url/--all-day/--calendar/--alarm/--clear-alarms"
             ).toJSON())
             throw ExitCode.failure
         }
@@ -528,7 +598,9 @@ struct EditEvent: ParsableCommand {
             url: url,
             allDay: allDay,
             calendarID: calendarID,
-            span: ekSpan
+            span: ekSpan,
+            alarms: alarms,
+            clearAlarms: alarmOptions.clearAlarms
         )
         try result.emit()
     }
@@ -561,19 +633,26 @@ struct EditReminder: ParsableCommand {
     @Option(name: .long, help: "Move the reminder to another reminder list (ID or alias).")
     var list: String?
 
+    @Option(name: .long, help: "New URL. Must include a scheme; pass an empty string to clear it.")
+    var url: String?
+
     @OptionGroup var locationOptions: LocationOptions
 
     @Flag(name: .long, help: "Remove the location trigger, leaving time alarms alone.")
     var clearLocation: Bool = false
 
+    @OptionGroup var alarmOptions: AlarmOptions
+
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
 
+        let alarms = try alarmOptions.validated()
+
         guard title != nil || due != nil || clearDue || priority != nil || notes != nil || list != nil
-            || locationOptions.isPresent || clearLocation else {
+            || url != nil || locationOptions.isPresent || clearLocation || alarmOptions.isPresent else {
             print(JSONOutput.error(
-                "Nothing to change — pass at least one of --title/--due/--clear-due/--priority/--notes/--list/--location/--radius/--proximity/--clear-location"
+                "Nothing to change — pass at least one of --title/--due/--clear-due/--priority/--notes/--list/--url/--location/--radius/--proximity/--clear-location/--alarm/--clear-alarms"
             ).toJSON())
             throw ExitCode.failure
         }
@@ -614,7 +693,10 @@ struct EditReminder: ParsableCommand {
             coordinate: coordinate,
             radius: locationOptions.radius,
             proximity: proximity,
-            clearLocation: clearLocation
+            clearLocation: clearLocation,
+            url: url,
+            alarms: alarms,
+            clearAlarms: alarmOptions.clearAlarms
         )
         try result.emit()
     }
