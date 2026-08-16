@@ -16,9 +16,43 @@ INSTALL_PATH="${HOME}/.local/bin/ekctl"
 BINARY_PATH="${PROJECT_DIR}/.build/release/ekctl"
 ENTITLEMENTS="${PROJECT_DIR}/ekctl.entitlements"
 INFO_PLIST="${PROJECT_DIR}/Info.plist"
-# Apple Development: <your signing identity> — stable identity, so TCC survives rebuilds.
-SIGNING_IDENTITY="${EKCTL_SIGNING_IDENTITY:-}"
 EXPECTED_IDENTIFIER="com.ekctl.cli"
+
+# The signing identity is per-developer, so it lives outside the repository. It is resolved from
+# $EKCTL_SIGNING_IDENTITY, then from a gitignored .signing-identity beside this script, and finally
+# by autodetection when the keychain holds exactly one Apple Development certificate. Whichever you
+# use, keep it stable: switching certificates has the same effect on TCC as not signing at all.
+SIGNING_IDENTITY="${EKCTL_SIGNING_IDENTITY:-}"
+if [ -z "$SIGNING_IDENTITY" ] && [ -f "${PROJECT_DIR}/.signing-identity" ]; then
+    SIGNING_IDENTITY="$(tr -d '[:space:]' < "${PROJECT_DIR}/.signing-identity")"
+fi
+if [ -z "$SIGNING_IDENTITY" ]; then
+    # `security find-identity` prints lines shaped `  1) <SHA-1> "Apple Development: Name (TEAM)"`.
+    # Autodetection is a convenience for a fresh clone, not a guarantee; it deliberately refuses to
+    # guess when the choice is ambiguous, because picking the wrong certificate revokes Calendar
+    # access on the next build and the failure surfaces far away from here.
+    candidates="$(security find-identity -v -p codesigning 2>/dev/null |
+        awk '/"Apple Development:/ { print $2 }')"
+    candidate_count="$(printf '%s\n' "$candidates" | grep -c '[0-9a-fA-F]' || true)"
+    if [ "$candidate_count" -eq 1 ]; then
+        SIGNING_IDENTITY="$(printf '%s\n' "$candidates" | grep '[0-9a-fA-F]')"
+        echo "Using autodetected signing identity ${SIGNING_IDENTITY}."
+        echo "Pin it with: echo ${SIGNING_IDENTITY} > ${PROJECT_DIR}/.signing-identity"
+    elif [ "$candidate_count" -eq 0 ]; then
+        echo "Error: no Apple Development signing certificate found in the keychain." >&2
+        echo "ekctl must be signed with a stable identity or macOS revokes its Calendar and" >&2
+        echo "Reminders access on every rebuild. Create a free Apple Development certificate in" >&2
+        echo "Xcode (Settings > Accounts > Manage Certificates), then either export" >&2
+        echo "EKCTL_SIGNING_IDENTITY=<sha1> or write it to ${PROJECT_DIR}/.signing-identity" >&2
+        exit 1
+    else
+        echo "Error: found ${candidate_count} Apple Development certificates; refusing to guess." >&2
+        echo "Choose one and pin it, either by exporting EKCTL_SIGNING_IDENTITY=<sha1> or by" >&2
+        echo "writing it to ${PROJECT_DIR}/.signing-identity :" >&2
+        security find-identity -v -p codesigning | grep '"Apple Development:' >&2
+        exit 1
+    fi
+fi
 
 AQUA_SERVICE=""
 AQUA_PLIST=""

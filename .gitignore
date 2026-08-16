@@ -39,3 +39,6 @@ DerivedData/
 *.d
 *.o
 *.swiftdeps
+
+# Per-developer signing identity (see build.sh)
+.signing-identity
