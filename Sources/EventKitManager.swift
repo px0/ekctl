@@ -23,9 +23,13 @@ import Foundation
 ///
 /// 5. Users can manage permissions in: System Settings > Privacy & Security > Calendars/Reminders
 class EventKitManager {
-    private let eventStore = EKEventStore()
+    private let eventStore: EKEventStore
     private var calendarAccessGranted = false
     private var reminderAccessGranted = false
+
+    init(eventStore: EKEventStore = EKEventStore()) {
+        self.eventStore = eventStore
+    }
 
     /// Requests access to both Calendar and Reminders.
     /// This must be called before any EventKit operations.
@@ -175,7 +179,8 @@ class EventKitManager {
         notes: String?,
         url: String?,
         allDay: Bool,
-        alarms: [AlarmSpec] = []
+        alarms: [AlarmSpec] = [],
+        recurrenceRule: EKRecurrenceRule? = nil
     ) -> JSONOutput {
         guard let calendar = eventStore.calendar(withIdentifier: calendarID) else {
             return JSONOutput.error("Calendar not found with ID: \(calendarID)", code: .notFound)
@@ -202,6 +207,9 @@ class EventKitManager {
         event.notes = notes
         event.url = parsedURL
         event.isAllDay = allDay
+        if let recurrenceRule = recurrenceRule {
+            event.recurrenceRules = [recurrenceRule]
+        }
         applyTimeAlarms(alarms, clear: false, to: event)
 
         do {
@@ -1071,6 +1079,7 @@ class EventKitManager {
         // event has no separate field for them the way a reminder does.
         dict["alarms"] = (event.alarms ?? []).map { $0.describedForOutput(using: formatter) }
         dict["hasRecurrenceRules"] = event.hasRecurrenceRules
+        dict["recurrenceRules"] = (event.recurrenceRules ?? []).map { JSONOutput.recurrenceSummary($0) }
 
         return dict
     }

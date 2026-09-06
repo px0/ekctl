@@ -384,11 +384,21 @@ struct AddEvent: ParsableCommand {
     @Flag(name: .long, help: "Mark as all-day event.")
     var allDay: Bool = false
 
+    @Option(name: .customLong("repeat"), help: "Recurrence: 'FREQ=DAILY' or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR'. Optional INTERVAL=n and COUNT=n or UNTIL=YYYYMMDD (23:59:59 local time) / YYYYMMDDTHHMMSSZ (UTC). Quote the value; BYDAY is weekly only.")
+    var recurrence: String?
+
     @OptionGroup var alarmOptions: AlarmOptions
 
     func run() throws {
-        let manager = EventKitManager()
-        try manager.requestAccess()
+        var recurrenceRule: EKRecurrenceRule?
+        if let recurrence = recurrence {
+            switch RecurrenceSpec.parse(recurrence) {
+            case .success(let spec): recurrenceRule = spec.rule()
+            case .failure(let failure):
+                try JSONOutput.error(failure.message, code: .invalidInput).emit()
+                return
+            }
+        }
 
         if alarmOptions.clearAlarms {
             print(JSONOutput.error("--clear-alarms applies to an edit; a new event has no alarms to clear.").toJSON())
@@ -405,6 +415,13 @@ struct AddEvent: ParsableCommand {
             throw ExitCode.failure
         }
 
+        if let until = recurrenceRule?.recurrenceEnd?.endDate, until < startDate {
+            try JSONOutput.error("Invalid --repeat: UNTIL must not be before --start.", code: .invalidInput).emit()
+            return
+        }
+
+        let manager = EventKitManager()
+        try manager.requestAccess()
         let calendarID = ConfigManager.resolveAlias(calendar)
         let result = manager.addEvent(
             calendarID: calendarID,
@@ -415,7 +432,8 @@ struct AddEvent: ParsableCommand {
             notes: notes,
             url: url,
             allDay: allDay,
-            alarms: alarms
+            alarms: alarms,
+            recurrenceRule: recurrenceRule
         )
         try result.emit()
     }

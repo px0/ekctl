@@ -1,3 +1,4 @@
+import EventKit
 import Foundation
 
 /// JSONOutput provides consistent JSON formatting for all CLI output.
@@ -16,6 +17,58 @@ struct JSONOutput {
             output["status"] = "success"
         }
         return JSONOutput(output)
+    }
+
+    /// A compact RRULE-style summary of the rule actually stored on the event. Include the other
+    /// EventKit frequencies and filters too, since reads can return rules created by Calendar.app.
+    static func recurrenceSummary(_ rule: EKRecurrenceRule) -> String {
+        let frequency: String
+        switch rule.frequency {
+        case .daily: frequency = "DAILY"
+        case .weekly: frequency = "WEEKLY"
+        case .monthly: frequency = "MONTHLY"
+        case .yearly: frequency = "YEARLY"
+        @unknown default: frequency = "UNKNOWN"
+        }
+        var parts = ["FREQ=\(frequency)"]
+        if rule.interval != 1 { parts.append("INTERVAL=\(rule.interval)") }
+
+        let weekdays: [EKWeekday: String] = [
+            .monday: "MO", .tuesday: "TU", .wednesday: "WE", .thursday: "TH",
+            .friday: "FR", .saturday: "SA", .sunday: "SU",
+        ]
+        if let days = rule.daysOfTheWeek, !days.isEmpty {
+            let values = days.map { day in
+                (day.weekNumber == 0 ? "" : String(day.weekNumber)) + (weekdays[day.dayOfTheWeek] ?? "?")
+            }
+            parts.append("BYDAY=\(values.joined(separator: ","))")
+        }
+        for (key, values) in [
+            ("BYMONTHDAY", rule.daysOfTheMonth), ("BYMONTH", rule.monthsOfTheYear),
+            ("BYWEEKNO", rule.weeksOfTheYear), ("BYYEARDAY", rule.daysOfTheYear),
+            ("BYSETPOS", rule.setPositions),
+        ] {
+            if let values = values, !values.isEmpty {
+                parts.append("\(key)=\(values.map { $0.stringValue }.joined(separator: ","))")
+            }
+        }
+        // Monday is the RRULE default; EventKit reports it even when no week start was supplied.
+        if let day = EKWeekday(rawValue: rule.firstDayOfTheWeek), day != .monday, let value = weekdays[day] {
+            parts.append("WKST=\(value)")
+        }
+        if let end = rule.recurrenceEnd {
+            if let date = end.endDate {
+                let formatter = DateFormatter()
+                formatter.locale = Locale(identifier: "en_US_POSIX")
+                formatter.calendar = Calendar(identifier: .gregorian)
+                formatter.timeZone = TimeZone(secondsFromGMT: 0)
+                formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+                parts.append("UNTIL=\(formatter.string(from: date))")
+            } else if end.occurrenceCount > 0 {
+                parts.append("COUNT=\(end.occurrenceCount)")
+            }
+        }
+        return parts.joined(separator: ";")
     }
 
     /// What kind of failure this is, for callers that must branch on it.

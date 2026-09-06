@@ -16,6 +16,11 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
             path: "Sources"
+        ),
+        .testTarget(
+            name: "ekctlTests",
+            dependencies: ["ekctl"],
+            path: "Tests"
         )
     ]
 )

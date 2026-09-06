@@ -5,6 +5,7 @@ A native macOS command-line tool for managing Calendar events and Reminders usin
 ## Features
 
 - List, create, edit, and delete calendar events
+- Create daily and weekly recurring events with `--repeat`, including weekday schedules
 - List, create, edit, complete, and delete reminders
 - **Alarms** on both events and reminders — relative offsets or absolute instants, on every add and edit verb
 - **Location triggers** on reminders — geocoded geofences that fire on arrival or departure
@@ -229,10 +230,62 @@ Output:
     "endDate": "2026-02-10T13:30:00Z",
     "location": null,
     "notes": null,
-    "allDay": false
+    "allDay": false,
+    "hasRecurrenceRules": false,
+    "recurrenceRules": []
   }
 }
 ```
+
+### Recurring Events
+
+Pass one quoted RRULE-style value to `add event`:
+
+```text
+--repeat 'FREQ=DAILY|WEEKLY[;BYDAY=MO,TU,...][;INTERVAL=n][;COUNT=n|;UNTIL=YYYYMMDD|;UNTIL=YYYYMMDDTHHMMSSZ]'
+```
+
+The brackets above mark optional fields and `|` marks alternatives; do not include them in the
+value. `FREQ` is required. Fields may appear in any order and are case-insensitive.
+
+```bash
+# Weekday mornings, ending after 20 occurrences (including the first)
+ekctl add event --calendar work --title "Morning planning" \
+  --start "2026-09-07T09:00:00-04:00" --end "2026-09-07T09:30:00-04:00" \
+  --repeat 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=20'
+```
+
+Supported fields:
+
+| Field | Values and meaning |
+|-------|--------------------|
+| `FREQ` | `DAILY` or `WEEKLY` |
+| `BYDAY` | Comma-separated `MO,TU,WE,TH,FR,SA,SU`; weekly only. Without it, weekly rules use the start date's weekday. |
+| `INTERVAL` | Integer from `1` to `2147483647`, default `1`: `2` means every other day or week. Larger values exceed EventKit's storage range and are rejected. |
+| `COUNT` | Positive total occurrence count, including the first occurrence. |
+| `UNTIL` | Inclusive cutoff: `YYYYMMDD` means 23:59:59 in the Mac's local timezone; `YYYYMMDDTHHMMSSZ` is an exact UTC instant. Must not precede `--start`. |
+
+Use `COUNT` or `UNTIL`, never both. Without either, the event repeats indefinitely.
+For daily events use `--repeat 'FREQ=DAILY'`; for Saturdays use
+`--repeat 'FREQ=WEEKLY;BYDAY=SA'`. For every other Saturday through the end of September use
+`--repeat 'FREQ=WEEKLY;BYDAY=SA;INTERVAL=2;UNTIL=20260930'`.
+Other frequencies, unknown fields, duplicate fields or weekdays, and malformed values return an
+`invalid_input` JSON error and exit 1 before requesting calendar access or saving an event.
+
+Event receipts and reads include `hasRecurrenceRules` and a `recurrenceRules` array of compact
+summaries derived from the stored rules, for example:
+
+```json
+{
+  "hasRecurrenceRules": true,
+  "recurrenceRules": ["FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=20"]
+}
+```
+
+Summaries omit `INTERVAL=1` and express `UNTIL` as a UTC instant, including when the input was a
+local date. Reads may also summarize recurrence types created by other apps that `--repeat` does
+not accept. The flag applies only to creation; existing recurring events still use `edit event`
+with `--span` to choose which occurrences an edit affects.
 
 ### Edit an Event
 
@@ -315,6 +368,12 @@ ekctl add reminder --list Todo --title "Renew passport" \
 An offset counts from an event's start and from a reminder's due date. A relative alarm on a
 reminder with no due date has nothing to be relative to and is refused rather than stored as
 something that can never fire.
+
+When `--alarm` is omitted on creation, ekctl supplies no time alarms and leaves EventKit's alarm
+state untouched. `--alarm 0` explicitly requests an "at the time" alarm. Receipts serialize the
+alarm objects EventKit returns; a zero offset in a receipt is not an ekctl default. If EventKit or
+a calendar provider supplies an alarm, ekctl does not clear it automatically. Inspect the receipt's
+`alarms` to confirm the result, and use `edit event <id> --clear-alarms` to remove time alarms.
 
 On an edit, the alarms you pass **replace** the existing ones rather than adding to them, so the
 flag describes the resulting state the way every other option on these commands does. `--clear-alarms`
@@ -652,7 +711,8 @@ ekctl delete reminder "REM123-456-789"
 
 ## Date Format
 
-All dates use **ISO 8601** format with timezone. Examples:
+Event and reminder timestamps use **ISO 8601** format with timezone. The `--repeat` cutoff uses
+the compact `UNTIL` formats described above. Examples:
 
 | Format | Example | Description |
 |--------|---------|-------------|
