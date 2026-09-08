@@ -217,9 +217,38 @@ struct ListReminders: ParsableCommand {
 
 struct Search: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Search across reminders.",
-        subcommands: [SearchReminders.self]
+        abstract: "Search across reminders or past calendar events.",
+        subcommands: [SearchReminders.self, SearchEvents.self]
     )
+}
+
+struct SearchEvents: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "events",
+        abstract: "Search all event calendars over the past four Toronto calendar years."
+    )
+
+    @Option(name: .long, parsing: .unconditionalSingleValue, help: "Literal text to look for in titles, attendees, locations, or notes. Repeat for alternatives.")
+    var term: [String] = []
+
+    @Option(name: .long, help: "Maximum matches to return (default: 20; maximum: 100).")
+    var limit: Int = 20
+
+    func run() throws {
+        let terms = term.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !terms.isEmpty, !terms.contains(where: \.isEmpty) else {
+            try JSONOutput.error("Pass at least one non-empty --term.", code: .invalidInput).emit()
+            return
+        }
+        guard (1...100).contains(limit) else {
+            try JSONOutput.error("--limit must be between 1 and 100.", code: .invalidInput).emit()
+            return
+        }
+
+        let manager = EventKitManager()
+        try manager.requestAccess()
+        try manager.searchPastEvents(terms: terms, limit: limit, now: Date()).emit()
+    }
 }
 
 struct SearchReminders: ParsableCommand {

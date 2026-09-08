@@ -477,6 +477,22 @@ completed half brings that to roughly 220 ms. Widen it with `--completed-since-d
 no limit, whenever the question is whether something was *ever* done. `--url` always searches the
 whole store, since a URL is an identity rather than a text query.
 
+### Search Past Events
+
+Search all accessible event calendars over the past four Toronto calendar years. Repeat `--term`
+for alternatives; terms match literally, ignoring case and diacritics, in event titles, attendees,
+locations, and notes.
+
+```bash
+ekctl search events --term "Smith" --term "Xes"
+ekctl search events --term "café" --limit 10
+```
+
+Only events which have already ended are returned, newest first. Results include the matching
+field names and a compact event identity suitable for a follow-up `show event`. The receipt reports
+the exact coverage window, calendars searched, and whether the limit truncated the result; it always
+uses `America/Toronto` for those dates.
+
 ### Create and Delete Reminder Lists
 
 ```bash

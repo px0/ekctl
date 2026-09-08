@@ -143,6 +143,70 @@ class EventKitManager {
         return JSONOutput.success(["events": eventDicts, "count": eventDicts.count])
     }
 
+    /// Searches the accessible event calendars without asking callers to guess a range. A single
+    /// EventKit event predicate may be silently shortened at four years, so two adjacent two-year
+    /// predicates make the stated coverage explicit and avoid losing the oldest half.
+    func searchPastEvents(terms: [String], limit: Int, now: Date) -> JSONOutput {
+        let calendars = eventStore.calendars(for: .event)
+        let window = HistoricalEventSearch.window(endingAt: now)
+        let midpoint = window.from.addingTimeInterval(window.to.timeIntervalSince(window.from) / 2)
+
+        let first = eventStore.predicateForEvents(withStart: window.from, end: midpoint, calendars: calendars)
+        let second = eventStore.predicateForEvents(withStart: midpoint, end: window.to, calendars: calendars)
+        let events = eventStore.events(matching: first) + eventStore.events(matching: second)
+
+        let matching = events.compactMap { event -> (event: EKEvent, fields: [String])? in
+            // A query returns events which overlap the range. The search is about past meetings,
+            // so exclude an in-progress or future occurrence even when its start overlaps now.
+            guard HistoricalEventSearch.isEligible(startDate: event.startDate, endDate: event.endDate, in: window) else {
+                return nil
+            }
+            let fields = HistoricalEventSearch.matchingFields(
+                terms: terms,
+                title: event.title,
+                attendees: attendeeValues(of: event),
+                location: event.location,
+                notes: event.notes
+            )
+            return fields.isEmpty ? nil : (event, fields)
+        }
+
+        var fieldsByKey: [String: [String]] = [:]
+        var eventByKey: [String: EKEvent] = [:]
+        for match in matching {
+            let key = eventSearchCandidate(for: match.event).key
+            fieldsByKey[key] = match.fields
+            eventByKey[key] = match.event
+        }
+        let sorted = HistoricalEventSearch.uniqueNewestFirst(matching.map { eventSearchCandidate(for: $0.event) })
+        let total = sorted.count
+        let returned = Array(sorted.prefix(limit))
+        let formatter = searchDateFormatter()
+        let resultEvents = returned.map { candidate -> [String: Any] in
+            let key = candidate.key
+            // Every candidate was created from `matching`, which fills both dictionaries above.
+            return eventSearchDict(eventByKey[key]!, matchedFields: fieldsByKey[key]!, formatter: formatter)
+        }
+
+        let coverageCalendars = calendars.map { calendar in
+            ["id": calendar.calendarIdentifier, "title": calendar.title, "source": calendar.source?.title ?? "Unknown"]
+        }
+        return JSONOutput.success([
+            "events": resultEvents,
+            "matched_count": total,
+            "returned_count": resultEvents.count,
+            "truncated": total > resultEvents.count,
+            "coverage": [
+                "from": formatter.string(from: window.from),
+                "to": formatter.string(from: window.to),
+                "time_zone": HistoricalEventSearch.timeZone.identifier,
+                "calendars": coverageCalendars,
+                "complete": true,
+                "scope": "past_four_years_available_in_eventkit",
+            ],
+        ])
+    }
+
     /// Shows details of a specific event
     func showEvent(eventID: String) -> JSONOutput {
         guard let event = eventStore.event(withIdentifier: eventID) else {
@@ -1037,6 +1101,92 @@ class EventKitManager {
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"  // ISO 8601 with timezone offset
         formatter.timeZone = TimeZone.current
         return formatter
+    }
+
+    private func searchDateFormatter() -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = HistoricalEventSearch.timeZone
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"
+        return formatter
+    }
+
+    private func attendeeValues(of event: EKEvent) -> [String] {
+        (event.attendees ?? []).flatMap { attendee in
+            [attendee.name, attendee.url.absoluteString].compactMap { $0 }
+        }
+    }
+
+    private func eventSearchCandidate(for event: EKEvent) -> HistoricalEventSearch.Candidate {
+        HistoricalEventSearch.Candidate(
+            calendarID: event.calendar?.calendarIdentifier ?? "",
+            eventID: event.eventIdentifier ?? "",
+            startDate: event.startDate ?? .distantPast,
+            occurrenceDate: event.occurrenceDate
+        )
+    }
+
+    private func eventSearchDict(
+        _ event: EKEvent, matchedFields: [String], formatter: DateFormatter
+    ) -> [String: Any] {
+        let calendar = event.calendar
+        var dict: [String: Any] = [
+            "id": event.eventIdentifier ?? "",
+            "title": event.title ?? "",
+            "startDate": event.startDate.map(formatter.string) ?? "",
+            "endDate": event.endDate.map(formatter.string) ?? "",
+            "calendarID": calendar?.calendarIdentifier ?? "",
+            "calendarTitle": calendar?.title ?? "",
+            "source": calendar?.source?.title ?? "Unknown",
+            "attendees": attendeeSummaries(of: event),
+            "status": eventStatusName(event.status),
+            "matchedFields": matchedFields,
+        ]
+        if let occurrenceDate = event.occurrenceDate {
+            dict["occurrenceDate"] = formatter.string(from: occurrenceDate)
+        }
+        return dict
+    }
+
+    private func eventStatusName(_ status: EKEventStatus) -> String {
+        switch status {
+        case .none: return "none"
+        case .confirmed: return "confirmed"
+        case .tentative: return "tentative"
+        case .canceled: return "canceled"
+        @unknown default: return "unknown"
+        }
+    }
+
+    /// Invitation state is evidence about the appointment, not attendance. Keeping it on each
+    /// attendee prevents a declined invite from being presented to Spock as proof of a visit.
+    private func attendeeSummaries(of event: EKEvent) -> [[String: Any]] {
+        (event.attendees ?? []).map { attendee in
+            let address = attendee.url.absoluteString
+            let email = address.lowercased().hasPrefix("mailto:")
+                ? String(address.dropFirst("mailto:".count))
+                : address
+            return [
+                "name": attendee.name ?? "",
+                "email": email.removingPercentEncoding ?? email,
+                "status": participantStatusName(attendee.participantStatus),
+            ]
+        }
+    }
+
+    private func participantStatusName(_ status: EKParticipantStatus) -> String {
+        switch status {
+        case .unknown: return "unknown"
+        case .pending: return "pending"
+        case .accepted: return "accepted"
+        case .declined: return "declined"
+        case .tentative: return "tentative"
+        case .delegated: return "delegated"
+        case .completed: return "completed"
+        case .inProcess: return "in_process"
+        @unknown default: return "unknown"
+        }
     }
 
     /// Converts an EKEvent to a dictionary for JSON output
