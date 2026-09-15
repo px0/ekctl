@@ -489,6 +489,12 @@ struct AddReminder: ParsableCommand {
     @Option(name: .long, help: "Optional notes.")
     var notes: String?
 
+    @Option(name: .customLong("repeat"), help: "Optional recurrence: 'FREQ=DAILY' or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR'. Optional INTERVAL=n and COUNT=n or UNTIL=YYYYMMDD (23:59:59 local time) / YYYYMMDDTHHMMSSZ (UTC). Requires --due; quote the value.")
+    var recurrence: String?
+
+    @Flag(name: .customLong("clear-repeat"), help: "Recurrence is edit-only; use --clear-repeat with edit reminder.")
+    var clearRepeat: Bool = false
+
     @Option(name: .long, help: "Optional URL. Must include a scheme, e.g. https://example.com or a custom scheme.")
     var url: String?
 
@@ -497,8 +503,23 @@ struct AddReminder: ParsableCommand {
     @OptionGroup var alarmOptions: AlarmOptions
 
     func run() throws {
-        let manager = EventKitManager()
-        try manager.requestAccess()
+        if clearRepeat {
+            try JSONOutput.error(
+                "--clear-repeat applies to edit reminder; a new reminder has no recurrence to clear.",
+                code: .invalidInput
+            ).emit()
+            return
+        }
+
+        var recurrenceRule: EKRecurrenceRule?
+        if let recurrence = recurrence {
+            switch RecurrenceSpec.parse(recurrence) {
+            case .success(let spec): recurrenceRule = spec.rule()
+            case .failure(let failure):
+                try JSONOutput.error(failure.message, code: .invalidInput).emit()
+                return
+            }
+        }
 
         if alarmOptions.clearAlarms {
             print(JSONOutput.error("--clear-alarms applies to an edit; a new reminder has no alarms to clear.").toJSON())
@@ -515,6 +536,20 @@ struct AddReminder: ParsableCommand {
             dueDate = parsed
         }
 
+        if recurrenceRule != nil && dueDate == nil {
+            try JSONOutput.error(
+                "A recurring reminder requires --due; the due date supplies its local wall-clock anchor.",
+                code: .invalidInput
+            ).emit()
+            return
+        }
+        if let until = recurrenceRule?.recurrenceEnd?.endDate, let dueDate, until < dueDate {
+            try JSONOutput.error(
+                "Invalid --repeat: UNTIL must not be before --due.", code: .invalidInput
+            ).emit()
+            return
+        }
+
         let coordinate = try locationOptions.validatedCoordinate()
         if locationOptions.location == nil && locationOptions.isPresent {
             print(JSONOutput.error(
@@ -523,6 +558,8 @@ struct AddReminder: ParsableCommand {
             throw ExitCode.failure
         }
 
+        let manager = EventKitManager()
+        try manager.requestAccess()
         let listID = ConfigManager.resolveAlias(list)
         let result = manager.addReminder(
             listID: listID,
@@ -535,7 +572,8 @@ struct AddReminder: ParsableCommand {
             coordinate: coordinate,
             radius: locationOptions.radius ?? EventKitManager.defaultLocationRadius,
             proximity: try locationOptions.validatedProximity() ?? .enter,
-            alarms: alarms
+            alarms: alarms,
+            recurrenceRule: recurrenceRule
         )
         try result.emit()
     }
@@ -592,7 +630,6 @@ struct EditEvent: ParsableCommand {
     func run() throws {
         let manager = EventKitManager()
         try manager.requestAccess()
-
         let alarms = try alarmOptions.validated()
 
         var startDate: Date?
@@ -677,6 +714,12 @@ struct EditReminder: ParsableCommand {
     @Option(name: .long, help: "New notes.")
     var notes: String?
 
+    @Option(name: .customLong("repeat"), help: "Set or replace the whole recurrence: 'FREQ=DAILY' or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR'. Optional INTERVAL=n and COUNT=n or UNTIL=YYYYMMDD (23:59:59 local time) / YYYYMMDDTHHMMSSZ (UTC). Requires an existing or new --due; quote the value.")
+    var recurrence: String?
+
+    @Flag(name: .customLong("clear-repeat"), help: "Clear all recurrence rules, leaving the reminder, due date and alarms in place.")
+    var clearRepeat: Bool = false
+
     @Option(name: .long, help: "Move the reminder to another reminder list (ID or alias).")
     var list: String?
 
@@ -691,15 +734,28 @@ struct EditReminder: ParsableCommand {
     @OptionGroup var alarmOptions: AlarmOptions
 
     func run() throws {
-        let manager = EventKitManager()
-        try manager.requestAccess()
+        var recurrenceRule: EKRecurrenceRule?
+        if let recurrence = recurrence {
+            switch RecurrenceSpec.parse(recurrence) {
+            case .success(let spec): recurrenceRule = spec.rule()
+            case .failure(let failure):
+                try JSONOutput.error(failure.message, code: .invalidInput).emit()
+                return
+            }
+        }
+        if recurrenceRule != nil && clearRepeat {
+            try JSONOutput.error(
+                "Cannot specify both --repeat and --clear-repeat.", code: .invalidInput
+            ).emit()
+            return
+        }
 
         let alarms = try alarmOptions.validated()
 
         guard title != nil || due != nil || clearDue || priority != nil || notes != nil || list != nil
-            || url != nil || locationOptions.isPresent || clearLocation || alarmOptions.isPresent else {
+            || recurrence != nil || clearRepeat || url != nil || locationOptions.isPresent || clearLocation || alarmOptions.isPresent else {
             print(JSONOutput.error(
-                "Nothing to change — pass at least one of --title/--due/--clear-due/--priority/--notes/--list/--url/--location/--radius/--proximity/--clear-location/--alarm/--clear-alarms"
+                "Nothing to change — pass at least one of --title/--due/--clear-due/--priority/--notes/--list/--repeat/--clear-repeat/--url/--location/--radius/--proximity/--clear-location/--alarm/--clear-alarms"
             ).toJSON())
             throw ExitCode.failure
         }
@@ -726,8 +782,24 @@ struct EditReminder: ParsableCommand {
             throw ExitCode.failure
         }
 
+        if recurrenceRule != nil && clearDue {
+            try JSONOutput.error(
+                "A recurring reminder requires a due date; pass --clear-repeat in the same edit if removing recurrence.",
+                code: .invalidInput
+            ).emit()
+            return
+        }
+        if let until = recurrenceRule?.recurrenceEnd?.endDate, let dueDate, until < dueDate {
+            try JSONOutput.error(
+                "Invalid --repeat: UNTIL must not be before --due.", code: .invalidInput
+            ).emit()
+            return
+        }
+
         let listID = list.map { ConfigManager.resolveAlias($0) }
 
+        let manager = EventKitManager()
+        try manager.requestAccess()
         let result = manager.editReminder(
             reminderID: id,
             title: title,
@@ -743,7 +815,9 @@ struct EditReminder: ParsableCommand {
             clearLocation: clearLocation,
             url: url,
             alarms: alarms,
-            clearAlarms: alarmOptions.clearAlarms
+            clearAlarms: alarmOptions.clearAlarms,
+            recurrenceRule: recurrenceRule,
+            clearRecurrence: clearRepeat
         )
         try result.emit()
     }

@@ -7,6 +7,8 @@ final class EventCreationTests: XCTestCase {
     private final class RecordingEventStore: EKEventStore {
         lazy var testCalendar = EKCalendar(for: .event, eventStore: self)
         var savedEvent: EKEvent?
+        var shownEvent: EKEvent?
+        var externalMatches: [EKCalendarItem] = []
 
         override func calendar(withIdentifier identifier: String) -> EKCalendar? {
             identifier == testCalendar.calendarIdentifier ? testCalendar : nil
@@ -14,6 +16,14 @@ final class EventCreationTests: XCTestCase {
 
         override func save(_ event: EKEvent, span: EKSpan) throws {
             savedEvent = event
+        }
+
+        override func event(withIdentifier identifier: String) -> EKEvent? {
+            shownEvent
+        }
+
+        override func calendarItems(withExternalIdentifier externalIdentifier: String) -> [EKCalendarItem] {
+            externalMatches
         }
     }
 
@@ -70,5 +80,37 @@ final class EventCreationTests: XCTestCase {
         XCTAssertEqual(alarm["type"] as? String, "relative")
         XCTAssertEqual(alarm["offsetSeconds"] as? Double, 0)
         XCTAssertEqual(alarm["offset"] as? String, "at the time")
+    }
+
+    func testShowEventReportsCurrentExternalIdentityAndMatchCount() throws {
+        let store = RecordingEventStore()
+        let event = EKEvent(eventStore: store)
+        event.calendar = store.testCalendar
+        event.title = "Dinner"
+        event.startDate = Date(timeIntervalSince1970: 1_800_000_000)
+        event.endDate = event.startDate.addingTimeInterval(3_600)
+        store.shownEvent = event
+        store.externalMatches = [event]
+
+        let result = EventKitManager(eventStore: store).showEvent(eventID: "current-event")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(result.toJSON().utf8)) as? [String: Any]
+        )
+        let shown = try XCTUnwrap(object["event"] as? [String: Any])
+        XCTAssertEqual(
+            shown["calendarItemExternalIdentifier"] as? String,
+            event.calendarItemExternalIdentifier
+        )
+        XCTAssertEqual(shown["externalIdentifierMatchCount"] as? Int, 1)
+
+        let duplicate = EKEvent(eventStore: store)
+        duplicate.calendar = store.testCalendar
+        store.externalMatches = [event, duplicate]
+        let ambiguous = EventKitManager(eventStore: store).showEvent(eventID: "current-event")
+        let ambiguousObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(ambiguous.toJSON().utf8)) as? [String: Any]
+        )
+        let ambiguousEvent = try XCTUnwrap(ambiguousObject["event"] as? [String: Any])
+        XCTAssertEqual(ambiguousEvent["externalIdentifierMatchCount"] as? Int, 2)
     }
 }

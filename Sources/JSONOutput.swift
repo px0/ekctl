@@ -82,6 +82,9 @@ struct JSONOutput {
         case invalidInput = "invalid_input"
         case permissionDenied = "permission_denied"
         case conflict = "conflict"
+        /// The provider may have saved the item, but could not prove the requested postcondition
+        /// from the object EventKit returned after the save. Callers must read before retrying.
+        case unconfirmed = "unconfirmed"
         case failed = "failed"
     }
 

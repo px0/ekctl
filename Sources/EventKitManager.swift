@@ -24,11 +24,16 @@ import Foundation
 /// 5. Users can manage permissions in: System Settings > Privacy & Security > Calendars/Reminders
 class EventKitManager {
     private let eventStore: EKEventStore
+    private let localTimeZone: TimeZone
     private var calendarAccessGranted = false
     private var reminderAccessGranted = false
 
-    init(eventStore: EKEventStore = EKEventStore()) {
+    init(
+        eventStore: EKEventStore = EKEventStore(),
+        localTimeZone: TimeZone = .current
+    ) {
         self.eventStore = eventStore
+        self.localTimeZone = localTimeZone
     }
 
     /// Requests access to both Calendar and Reminders.
@@ -213,7 +218,22 @@ class EventKitManager {
             return JSONOutput.error("Event not found with ID: \(eventID)", code: .notFound)
         }
 
-        return JSONOutput.success(["event": eventToDict(event)])
+        var payload = eventToDict(event)
+        let externalIdentifier = event.calendarItemExternalIdentifier?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let externalIdentifier, !externalIdentifier.isEmpty {
+            payload["calendarItemExternalIdentifier"] = externalIdentifier
+            // Apple's external identifier is not globally unique: imported copies, shared
+            // calendars, delegates, subscriptions, and recurring series can collide. The link
+            // resolver must see positive uniqueness evidence rather than treating the string as
+            // proof by itself.
+            payload["externalIdentifierMatchCount"] = eventStore
+                .calendarItems(withExternalIdentifier: externalIdentifier).count
+        } else {
+            payload["calendarItemExternalIdentifier"] = NSNull()
+            payload["externalIdentifierMatchCount"] = 0
+        }
+        return JSONOutput.success(["event": payload])
     }
 
     /// Parses a user-supplied URL string. An explicit scheme is required: EventKit would happily
@@ -713,8 +733,15 @@ class EventKitManager {
         coordinate: CLLocationCoordinate2D? = nil,
         radius: Double = EventKitManager.defaultLocationRadius,
         proximity: EKAlarmProximity = .enter,
-        alarms: [AlarmSpec] = []
+        alarms: [AlarmSpec] = [],
+        recurrenceRule: EKRecurrenceRule? = nil
     ) -> JSONOutput {
+        if recurrenceRule != nil && dueDate == nil {
+            return JSONOutput.error(
+                "A recurring reminder requires a due date; due_date supplies its local wall-clock anchor.",
+                code: .invalidInput
+            )
+        }
         if let refusal = rejectUndatedRelativeAlarms(alarms, hasDueDate: dueDate != nil) {
             return refusal
         }
@@ -746,6 +773,9 @@ class EventKitManager {
         if let dueDate = dueDate {
             reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
         }
+        if let recurrenceRule = recurrenceRule {
+            reminder.recurrenceRules = [recurrenceRule]
+        }
         applyTimeAlarms(alarms, clear: false, to: reminder)
 
         var matchedAddress: String?
@@ -766,10 +796,27 @@ class EventKitManager {
 
         do {
             try eventStore.save(reminder, commit: true)
+            var storedReminder = reminder
+            if let recurrenceRule = recurrenceRule {
+                let expected = JSONOutput.recurrenceSummary(recurrenceRule)
+                guard let readBack = readBackReminder(reminder) else {
+                    return unconfirmedRecurrence(
+                        operation: "create", expected: [expected], reminder: reminder,
+                        stored: nil
+                    )
+                }
+                storedReminder = readBack
+                guard storedRecurrence(on: readBack) == [expected] else {
+                    return unconfirmedRecurrence(
+                        operation: "create", expected: [expected], reminder: reminder,
+                        stored: readBack
+                    )
+                }
+            }
             var payload: [String: Any] = [
                 "status": "success",
                 "message": "Reminder created successfully",
-                "reminder": reminderToDict(reminder)
+                "reminder": reminderToDict(storedReminder)
             ]
             if let matchedAddress = matchedAddress {
                 payload["geocodedTo"] = matchedAddress
@@ -797,14 +844,56 @@ class EventKitManager {
         clearLocation: Bool = false,
         url: String? = nil,
         alarms: [AlarmSpec] = [],
-        clearAlarms: Bool = false
+        clearAlarms: Bool = false,
+        recurrenceRule: EKRecurrenceRule? = nil,
+        clearRecurrence: Bool = false
     ) -> JSONOutput {
         guard let reminder = eventStore.calendarItem(withIdentifier: reminderID) as? EKReminder else {
             return JSONOutput.error("Reminder not found with ID: \(reminderID)", code: .notFound)
         }
 
+        if recurrenceRule != nil && clearRecurrence {
+            return JSONOutput.error(
+                "Cannot specify both --repeat and --clear-repeat.", code: .invalidInput
+            )
+        }
+
         if clearDue && dueDate != nil {
-            return JSONOutput.error("Cannot specify both a due date and --clear-due.")
+            return JSONOutput.error(
+                "Cannot specify both a due date and --clear-due.", code: .invalidInput
+            )
+        }
+
+        // A recurrence's local wall-clock anchor is the reminder due date. Validate the resulting
+        // pair before changing any live EKReminder properties, including when the existing item
+        // already carries a rule that a clear-due edit would otherwise strand.
+        if recurrenceRule != nil && clearDue {
+            return JSONOutput.error(
+                "A recurring reminder requires a due date; due_date supplies its local wall-clock anchor. "
+                    + "Pass --clear-repeat in the same edit if you are removing recurrence.",
+                code: .invalidInput
+            )
+        }
+        if clearDue && !clearRecurrence && !(reminder.recurrenceRules ?? []).isEmpty {
+            return JSONOutput.error(
+                "Cannot clear the due date while recurrence remains. Pass --clear-repeat in the same edit.",
+                code: .invalidInput
+            )
+        }
+        if recurrenceRule != nil && dueDate == nil && reminder.dueDateComponents == nil {
+            return JSONOutput.error(
+                "A recurring reminder requires a due date; due_date supplies its local wall-clock anchor.",
+                code: .invalidInput
+            )
+        }
+        if let recurrenceEnd = recurrenceRule?.recurrenceEnd?.endDate {
+            let anchor = dueDate ?? reminder.dueDateComponents.flatMap { reminderDueDate(from: $0) }
+            if let anchor, recurrenceEnd < anchor {
+                return JSONOutput.error(
+                    "Invalid --repeat: UNTIL must not be before the reminder due date.",
+                    code: .invalidInput
+                )
+            }
         }
 
         if clearLocation && (location != nil || coordinate != nil || radius != nil || proximity != nil) {
@@ -866,6 +955,11 @@ class EventKitManager {
         } else if let dueDate = dueDate {
             reminder.dueDateComponents = reminderDueDateComponents(from: dueDate)
         }
+        if let recurrenceRule = recurrenceRule {
+            reminder.recurrenceRules = [recurrenceRule]
+        } else if clearRecurrence {
+            reminder.recurrenceRules = []
+        }
         applyTimeAlarms(alarms, clear: clearAlarms, to: reminder)
 
         var matchedAddress: String?
@@ -905,10 +999,41 @@ class EventKitManager {
 
         do {
             try eventStore.save(reminder, commit: true)
+            var storedReminder = reminder
+            if let recurrenceRule = recurrenceRule {
+                let expected = [JSONOutput.recurrenceSummary(recurrenceRule)]
+                guard let readBack = readBackReminder(reminder) else {
+                    return unconfirmedRecurrence(
+                        operation: "edit", expected: expected, reminder: reminder,
+                        stored: nil
+                    )
+                }
+                storedReminder = readBack
+                guard storedRecurrence(on: readBack) == expected else {
+                    return unconfirmedRecurrence(
+                        operation: "edit", expected: expected, reminder: reminder,
+                        stored: readBack
+                    )
+                }
+            } else if clearRecurrence {
+                guard let readBack = readBackReminder(reminder) else {
+                    return unconfirmedRecurrence(
+                        operation: "clear recurrence", expected: [], reminder: reminder,
+                        stored: nil
+                    )
+                }
+                storedReminder = readBack
+                guard storedRecurrence(on: readBack).isEmpty else {
+                    return unconfirmedRecurrence(
+                        operation: "clear recurrence", expected: [], reminder: reminder,
+                        stored: readBack
+                    )
+                }
+            }
             var payload: [String: Any] = [
                 "status": "success",
                 "message": "Reminder updated successfully",
-                "reminder": reminderToDict(reminder)
+                "reminder": reminderToDict(storedReminder)
             ]
             if let matchedAddress = matchedAddress {
                 payload["geocodedTo"] = matchedAddress
@@ -1089,17 +1214,24 @@ class EventKitManager {
 
     /// Converts a due date into the date components EventKit expects for a reminder's due date.
     private func reminderDueDateComponents(from date: Date) -> DateComponents {
-        Calendar.current.dateComponents(
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = localTimeZone
+        var components = calendar.dateComponents(
             [.year, .month, .day, .hour, .minute, .second],
             from: date
         )
+        // EKReminder otherwise treats these as floating components. Keeping the zone on the
+        // components makes the sole recurrence anchor explicit and preserves the local hour over
+        // Toronto's 23- and 25-hour DST days.
+        components.timeZone = localTimeZone
+        return components
     }
 
     /// Creates a date formatter that outputs ISO 8601 format in the user's local timezone
     private func localDateFormatter() -> DateFormatter {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"  // ISO 8601 with timezone offset
-        formatter.timeZone = TimeZone.current
+        formatter.timeZone = localTimeZone
         return formatter
     }
 
@@ -1250,7 +1382,7 @@ class EventKitManager {
         ]
 
         if let dueDateComponents = reminder.dueDateComponents,
-           let dueDate = Calendar.current.date(from: dueDateComponents) {
+           let dueDate = reminderDueDate(from: dueDateComponents) {
             dict["dueDate"] = formatter.string(from: dueDate)
         } else {
             dict["dueDate"] = NSNull()
@@ -1295,7 +1427,49 @@ class EventKitManager {
             dict["locationTrigger"] = NSNull()
         }
 
+        // This field is deliberately present even when empty. An older provider may omit it and
+        // the Spock facade will then report recurrence as unknown; an empty array is the positive
+        // provider evidence that this item is one-time.
+        dict["recurrenceRules"] = storedRecurrence(on: reminder)
+
         return dict
+    }
+
+    private func reminderDueDate(from components: DateComponents) -> Date? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = components.timeZone ?? localTimeZone
+        return calendar.date(from: components)
+    }
+
+    private func readBackReminder(_ reminder: EKReminder) -> EKReminder? {
+        let identifier = reminder.calendarItemIdentifier
+        guard !identifier.isEmpty else { return nil }
+        return eventStore.calendarItem(withIdentifier: identifier) as? EKReminder
+    }
+
+    private func storedRecurrence(on reminder: EKReminder) -> [String] {
+        (reminder.recurrenceRules ?? []).map { JSONOutput.recurrenceSummary($0) }
+    }
+
+    private func unconfirmedRecurrence(
+        operation: String,
+        expected: [String],
+        reminder: EKReminder,
+        stored: EKReminder?
+    ) -> JSONOutput {
+        let storedRules = stored.map { storedRecurrence(on: $0) }
+        let expectedText = expected.isEmpty ? "none" : expected.joined(separator: ", ")
+        let storedText: String
+        if let storedRules {
+            storedText = storedRules.isEmpty ? "none" : storedRules.joined(separator: ", ")
+        } else {
+            storedText = "no read-back object"
+        }
+        return JSONOutput.error(
+            "Reminder \(operation) may have been saved, but its stored recurrence could not be confirmed. "
+                + "Expected \(expectedText); EventKit returned \(storedText). Read reminder \(reminder.calendarItemIdentifier) by ID before retrying.",
+            code: .unconfirmed
+        )
     }
 }
 
